@@ -6,12 +6,13 @@ from math import pi, sin, cos
 import bosdyn.client
 import bosdyn.client.lease
 import bosdyn.client.util
-from bosdyn.api import arm_command_pb2, robot_command_pb2, geometry_pb2
-from bosdyn.client import math_helpers
-from bosdyn.client.frame_helpers import GRAV_ALIGNED_BODY_FRAME_NAME, ODOM_FRAME_NAME, HAND_FRAME_NAME, get_a_tform_b
+from bosdyn.api import arm_command_pb2, robot_command_pb2, geometry_pb2, world_object_pb2
+from bosdyn.client import math_helpers, frame_helpers
+from bosdyn.client.frame_helpers import GRAV_ALIGNED_BODY_FRAME_NAME, ODOM_FRAME_NAME, HAND_FRAME_NAME, get_a_tform_b, get_se2_a_tform_b
 from bosdyn.client.robot_command import RobotCommandBuilder, RobotCommandClient, blocking_stand, block_until_arm_arrives
 from bosdyn.client.robot_state import RobotStateClient
 from bosdyn.client.power import PowerClient
+from bosdyn.client.world_object import WorldObjectClient
 from bosdyn import geometry
 
 def rotate_around_arm(config):
@@ -38,6 +39,7 @@ def rotate_around_arm(config):
         command_client = robot.ensure_client(RobotCommandClient.default_service_name)
         state_client = robot.ensure_client(RobotStateClient.default_service_name)
         power_client = robot.ensure_client(PowerClient.default_service_name)
+        world_object_client = robot.ensure_client(WorldObjectClient.default_service_name)
 
         # response = power_client.fan_power_command(percent_power=1, duration=100)
         # time.sleep(1)
@@ -112,30 +114,50 @@ def rotate_around_arm(config):
         
         # body pose in hand frame
         body_pos_vector_in_hand = get_a_tform_b(transforms, GRAV_ALIGNED_BODY_FRAME_NAME, HAND_FRAME_NAME).inverse()
+
+        # TODO: Change this to grav aligned odom frame
+        # This adds a gravity aligned hand frame 
+
+        # TODO: What if you don't add an extra frame
         
-        # body translation in hand frame
-        # need to make a gravity aligned hand frame
+        gripper_in_odom = get_a_tform_b(transforms, ODOM_FRAME_NAME, HAND_FRAME_NAME)
 
-        dx_body = cos(theta) * body_pos_vector_in_hand.x - sin(theta) * body_pos_vector_in_hand.y
-        dy_body = sin(theta) * body_pos_vector_in_hand.x + cos(theta) * body_pos_vector_in_hand.y
+        frame_tree_edges = {}
 
-        body_delta_T_translation = geometry_pb2.Vec3(x=dx_body, y=dy_body,z=body_pos_vector_in_hand.z)
+        grav_aligned_hand_frame = geometry_pb2.SE3Pose(
+            position=geometry_pb2.Vec3(x=gripper_in_odom.position.x,y=gripper_in_odom.position.y,z=gripper_in_odom.position.z),
+            rotation=geometry_pb2.Quaternion(w=1,x=0,y=0,z=0)
+            )
+        
+        frame_tree_edges = frame_helpers.add_edge_to_tree(frame_tree_edges, grav_aligned_hand_frame, HAND_FRAME_NAME, "grav_aligned_hand_frame")
+
+        snapshot = geometry_pb2.FrameTreeSnapshot(child_to_parent_edge_map=frame_tree_edges)
+        world_obj_special_frame = world_object_pb2.WorldObject(id=21, name="GRAV_ALIGNED_HAND_FRAME_NAME", transforms_snapshot=snapshot, acquisition_time=time.time())
+
+        world_object_client.mutate_world_objects(mutation_req=bosdyn.client.world_object.make_add_world_object_req(world_obj_special_frame))
+
+        # Base in grav aligned hand frame
+        body_in_gripper = get_a_tform_b(transforms, "GRAV_ALIGNED_HAND_FRAME_NAME", GRAV_ALIGNED_BODY_FRAME_NAME)
+
+        # Change in body location in the grav aligned hand frame
+        dx_body = cos(theta) * body_in_gripper.x - sin(theta) * body_in_gripper.y
+        dy_body = sin(theta) * body_in_gripper.x + cos(theta) * body_in_gripper.y
+
+        # Constructing the delta position and orientation in the grav aligned hand frame
+        body_delta_T_translation = geometry_pb2.Vec3(x=dx_body, y=dy_body,z=body_in_gripper.z)
 
         body_delta_T_euler_rot = geometry.EulerZXY(roll=0, pitch=0, yaw=theta)
-        
-        body_delta_T_quat = body_pos_vector_in_hand.rot * math_helpers.Quat.from_proto(body_delta_T_euler_rot.to_quaternion())
-        body_T_euler_yaw = body_delta_T_quat.to_yaw()
+        body_delta_T_quat = body_delta_T_euler_rot.to_quaternion()
 
-        # hand_to_body
-        body_T = geometry_pb2.SE3Pose(position=body_delta_T_translation, rotation=body_delta_T_quat.to_proto())
+        # math_helpers SE3 of delta pose
+        body_dT = math_helpers.Quat.from_proto(geometry_pb2.SE3Pose(position=body_delta_T_translation, rotation=body_delta_T_quat))
 
-        # SE3 describing body in odom frame
-        body_T_in_odom = get_a_tform_b(transforms, ODOM_FRAME_NAME, HAND_FRAME_NAME) * body_T
+        # SE3 describing body in odom frame by multiplying the grav_odom to grav_hand transform
+        body_T_in_odom = get_a_tform_b(transforms, ODOM_FRAME_NAME, "GRAV_ALIGNED_HAND_FRAME_NAME") * body_dT
 
-        # now give this to trajectory command somehow
-
+        # now give this to trajectory command to execute the transform
         body_move_command = RobotCommandBuilder.trajectory_command(
-            goal_x = body_delta_T_translation.x, goal_y = body_delta_T_translation.y, goal_heading=body_T_euler_yaw, frame_name=HAND_FRAME_NAME
+            goal_x = body_delta_T_translation.position.x, goal_y = body_delta_T_translation.position.y, goal_heading=body_T_euler_yaw, frame_name=ODOM_FRAME_NAME
         )
         end_time = 5.0
         gaze_target_in_odom = body_pos_vector_in_hand.transform_point(x = 1.5, y = 0, z = 0)
@@ -170,7 +192,7 @@ def main(argv):
         return True
     except Exception as exc:
         logger = bosdyn.client.util.get_logger()
-        logger.exception("Threw and exception")
+        logger.exception("Threw an exception")
         return False
 
 if __name__ == '__main__':
