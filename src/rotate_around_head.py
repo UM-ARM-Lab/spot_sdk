@@ -7,6 +7,7 @@ import bosdyn.client
 import bosdyn.client.lease
 import bosdyn.client.util
 from bosdyn.api import arm_command_pb2, robot_command_pb2, geometry_pb2, world_object_pb2
+from bosdyn.api.spot import robot_command_pb2 as spot_command_pb2
 from bosdyn.client import math_helpers, frame_helpers
 from bosdyn.client.frame_helpers import GRAV_ALIGNED_BODY_FRAME_NAME, ODOM_FRAME_NAME, HAND_FRAME_NAME, get_a_tform_b, get_se2_a_tform_b
 from bosdyn.client.robot_command import RobotCommandBuilder, RobotCommandClient, blocking_stand, block_until_arm_arrives
@@ -45,7 +46,7 @@ def rotate_around_arm(config):
         # time.sleep(1)
         # feedback1 = power_client.fan_power_command_feedback(response.command_id)
         
-        #blocking_stand(command_client, timeout_sec=10)
+        blocking_stand(command_client, timeout_sec=10)
         robot.logger.info("Robot standing.")
 
         ###### begin trajectory for deploying arm close to ground ####
@@ -90,14 +91,14 @@ def rotate_around_arm(config):
 
         # full synchronous arm and gripper cmd
         arm_deploy_command = RobotCommandBuilder.build_synchro_command(gripper_command, arm_command)
-        #deploy_cmd_id = command_client.robot_command(arm_deploy_command)
+        deploy_cmd_id = command_client.robot_command(arm_deploy_command)
         robot.logger.info("deploying arm.")
 
-        #block_until_arm_arrives(command_client, deploy_cmd_id)
+        block_until_arm_arrives(command_client, deploy_cmd_id)
 
         time.sleep(2)
         gripper_close_command = RobotCommandBuilder.claw_gripper_close_command()
-        #gripper_close_id = command_client.robot_command(gripper_close_command)
+        gripper_close_id = command_client.robot_command(gripper_close_command)
         robot.logger.info("closing gripper.")
         time.sleep(0.5)
 
@@ -110,65 +111,38 @@ def rotate_around_arm(config):
         # Somehow I think I have to set the arm frame?
         #  Transform in the arm frame
         # theta that the body must rotate in radians
-        theta = pi / 3.0
+        theta = pi / 6
         
         # body pose in hand frame
-        body_pos_vector_in_hand = get_a_tform_b(transforms, GRAV_ALIGNED_BODY_FRAME_NAME, HAND_FRAME_NAME).inverse()
-
-        # TODO: Change this to grav aligned odom frame
-        # This adds a gravity aligned hand frame 
-
-        # TODO: What if you don't add an extra frame
-        
-        gripper_in_odom = get_a_tform_b(transforms, ODOM_FRAME_NAME, HAND_FRAME_NAME)
-
-        frame_tree_edges = {}
-
-        grav_aligned_hand_frame = geometry_pb2.SE3Pose(
-            position=geometry_pb2.Vec3(x=gripper_in_odom.position.x,y=gripper_in_odom.position.y,z=gripper_in_odom.position.z),
-            rotation=geometry_pb2.Quaternion(w=1,x=0,y=0,z=0)
-            )
-        
-        frame_tree_edges = frame_helpers.add_edge_to_tree(frame_tree_edges, grav_aligned_hand_frame, HAND_FRAME_NAME, "grav_aligned_hand_frame")
-
-        snapshot = geometry_pb2.FrameTreeSnapshot(child_to_parent_edge_map=frame_tree_edges)
-        world_obj_special_frame = world_object_pb2.WorldObject(id=21, name="GRAV_ALIGNED_HAND_FRAME_NAME", transforms_snapshot=snapshot, acquisition_time=time.time())
-
-        world_object_client.mutate_world_objects(mutation_req=bosdyn.client.world_object.make_add_world_object_req(world_obj_special_frame))
+        body_in_gripper_3d = get_a_tform_b(transforms, GRAV_ALIGNED_BODY_FRAME_NAME, HAND_FRAME_NAME).inverse()
 
         # Base in grav aligned hand frame
-        body_in_gripper = get_a_tform_b(transforms, "GRAV_ALIGNED_HAND_FRAME_NAME", GRAV_ALIGNED_BODY_FRAME_NAME)
+        # body in odom * odom in gripper = body in gripper
+        body_in_gripper = get_se2_a_tform_b(transforms, GRAV_ALIGNED_BODY_FRAME_NAME, HAND_FRAME_NAME).inverse()
 
         # Change in body location in the grav aligned hand frame
         dx_body = cos(theta) * body_in_gripper.x - sin(theta) * body_in_gripper.y
         dy_body = sin(theta) * body_in_gripper.x + cos(theta) * body_in_gripper.y
 
-        # Constructing the delta position and orientation in the grav aligned hand frame
-        body_delta_T_translation = geometry_pb2.Vec3(x=dx_body, y=dy_body,z=body_in_gripper.z)
+        # math_helpers SE2 of change in body pose in hand frame, i.e. body in hand
+        body_T_in_hand = math_helpers.SE2Pose.from_proto(geometry_pb2.SE2Pose(position=geometry_pb2.Vec2(x=dx_body, y=dy_body),angle=theta))
 
-        body_delta_T_euler_rot = geometry.EulerZXY(roll=0, pitch=0, yaw=theta)
-        body_delta_T_quat = body_delta_T_euler_rot.to_quaternion()
-
-        # math_helpers SE3 of delta pose
-        body_dT = math_helpers.Quat.from_proto(geometry_pb2.SE3Pose(position=body_delta_T_translation, rotation=body_delta_T_quat))
-
-        # SE3 describing body in odom frame by multiplying the grav_odom to grav_hand transform
-        body_T_in_odom = get_a_tform_b(transforms, ODOM_FRAME_NAME, "GRAV_ALIGNED_HAND_FRAME_NAME") * body_dT
+        # SE2 describing body in odom frame by multiplying the grav_odom to grav_hand transform
+        body_T_in_odom = get_se2_a_tform_b(transforms, ODOM_FRAME_NAME, HAND_FRAME_NAME) * body_T_in_hand
 
         # now give this to trajectory command to execute the transform
-        body_move_command = RobotCommandBuilder.trajectory_command(
-            goal_x = body_delta_T_translation.position.x, goal_y = body_delta_T_translation.position.y, goal_heading=body_T_euler_yaw, frame_name=ODOM_FRAME_NAME
-        )
+        body_move_command = RobotCommandBuilder.synchro_se2_trajectory_command(
+            goal_se2=body_T_in_odom.to_proto(), frame_name=ODOM_FRAME_NAME, locomotion_hint=spot_command_pb2.HINT_CRAWL)
         end_time = 5.0
-        gaze_target_in_odom = body_pos_vector_in_hand.transform_point(x = 1.5, y = 0, z = 0)
+        gaze_target_in_odom = body_in_gripper_3d.transform_point(x = 1.5, y = 0, z = 0)
         gaze_command = RobotCommandBuilder.arm_gaze_command(gaze_target_in_odom[0],
                                                             gaze_target_in_odom[1],
-                                                            gaze_target_in_odom[2],
+                                                            0,
                                                             ODOM_FRAME_NAME)
         
         #follow_arm_command = RobotCommandBuilder.follow_arm_command()
 
-        #body_command_id = command_client.robot_command(body_move_command, end_time_secs=time.time() + end_time)
+        body_command_id = command_client.robot_command(body_move_command, end_time_secs=time.time() + end_time)
         #synchro_command = RobotCommandBuilder.build_synchro_command(body_move_command, gaze_command)
         #synchro_command_id = command_client.robot_command(synchro_command)
         #block_until_arm_arrives(command_client, synchro_command_id, 5.0)
@@ -179,8 +153,29 @@ def rotate_around_arm(config):
         assert not robot.is_powered_on(), "Robot power off failed."
         robot.logger.info("Robot safely powered off.")
         
+def calculate_traj_angle_points(transforms, angle):
+    # split the angle into ~ 30 degree angle chunks
+    # Returns: a set of body waypoint poses in odom frame
+    body_in_gripper = get_se2_a_tform_b(transforms, GRAV_ALIGNED_BODY_FRAME_NAME, HAND_FRAME_NAME).inverse()
 
-        
+    traj_points = []
+    poses = []
+    sub_angle = pi/6
+    while (sub_angle < angle):
+        traj_points.append(sub_angle)
+        sub_angle += pi/6
+    traj_points.append(angle)
+    for a in traj_points:
+        dx_body = cos(a) * body_in_gripper.x - sin(a) * body_in_gripper.y
+        dy_body = sin(a) * body_in_gripper.x + cos(a) * body_in_gripper.y
+
+        # math_helpers SE2 of change in body pose in hand frame, i.e. body in hand
+        body_T_in_hand = math_helpers.SE2Pose.from_proto(geometry_pb2.SE2Pose(position=geometry_pb2.Vec2(x=dx_body, y=dy_body),angle=a))
+
+        # SE2 describing body in odom frame by multiplying the grav_odom to grav_hand transform
+        poses.append(get_se2_a_tform_b(transforms, ODOM_FRAME_NAME, HAND_FRAME_NAME) * body_T_in_hand)
+    return poses
+    
 
 def main(argv):
     parser = argparse.ArgumentParser()
