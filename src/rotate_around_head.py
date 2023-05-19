@@ -2,6 +2,8 @@ import argparse
 import sys
 import time
 from math import pi, sin, cos
+import matplotlib.pyplot as plt
+import numpy as np
 
 import bosdyn.client
 import bosdyn.client.lease
@@ -49,12 +51,18 @@ def rotate_around_arm(config):
         blocking_stand(command_client, timeout_sec=10)
         robot.logger.info("Robot standing.")
 
+        ##### Construct and grav aligned odom frame #####
+
+        # frame_tree_edges = {}
+
+        # vision_tform_special_frame
+
         ###### begin trajectory for deploying arm close to ground ####
 
         # Final position of the gripper relative to the gravity aligned body frmae
-        x = 0.75
+        x = 0.9
         y = 0
-        z = 0.25
+        z = -0.25
 
         hand_ewrt_flat_body = geometry_pb2.Vec3(x=x,y=y,z=z)
 
@@ -69,18 +77,17 @@ def rotate_around_arm(config):
         hand_quat = hand_rpy_euler.to_quaternion()
 
         # SE3 of hand in flat body frame
-
         flat_body_T_hand = geometry_pb2.SE3Pose(position=hand_ewrt_flat_body, rotation=hand_quat)
 
-        # Express this transform in odom frame
-        robot_state = state_client.get_robot_state()
+        # Get the tf tree
+        transforms = state_client.get_robot_state().kinematic_state.transforms_snapshot
 
-        # tf from odom to body frame
-        odom_T_flat_body = get_a_tform_b(robot_state.kinematic_state.transforms_snapshot, ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME)
+        # body frame in odom
+        odom_T_flat_body = get_a_tform_b(transforms, ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME)
 
         # combine previously found transforms to express hand in odom frame
         # converts geometry_pb2.SE3 to math_helpers.pb2.SE3 
-        odom_T_hand = odom_T_flat_body * math_helpers.SE3Pose.from_obj(flat_body_T_hand)
+        odom_T_hand = odom_T_flat_body * math_helpers.SE3Pose.from_proto(flat_body_T_hand)
 
         seconds = 1.5
         
@@ -105,77 +112,101 @@ def rotate_around_arm(config):
         ## start rotating around a fixed point in space (the location of the hand)
         # move the body as intended and tell the gripper to synchronously go to the same location it started at in odom space
         
-        # get the "tf tree"
+        # Update the "tf tree"
         transforms = state_client.get_robot_state().kinematic_state.transforms_snapshot
 
-        # Somehow I think I have to set the arm frame?
-        #  Transform in the arm frame
         # theta that the body must rotate in radians
-        theta = pi / 6
-        
-        # body pose in hand frame
-        body_in_gripper_3d = get_a_tform_b(transforms, GRAV_ALIGNED_BODY_FRAME_NAME, HAND_FRAME_NAME).inverse()
+        theta = -pi/2
 
-        # Base in grav aligned hand frame
-        # body in odom * odom in gripper = body in gripper
-        body_in_gripper = get_se2_a_tform_b(transforms, GRAV_ALIGNED_BODY_FRAME_NAME, HAND_FRAME_NAME).inverse()
+        traj_points, arm_points = calculate_traj_angle_points(r, p, transforms, theta)
 
-        # Change in body location in the grav aligned hand frame
-        dx_body = cos(theta) * body_in_gripper.x - sin(theta) * body_in_gripper.y
-        dy_body = sin(theta) * body_in_gripper.x + cos(theta) * body_in_gripper.y
-
-        # math_helpers SE2 of change in body pose in hand frame, i.e. body in hand
-        body_T_in_hand = math_helpers.SE2Pose.from_proto(geometry_pb2.SE2Pose(position=geometry_pb2.Vec2(x=dx_body, y=dy_body),angle=theta))
-
-        # SE2 describing body in odom frame by multiplying the grav_odom to grav_hand transform
-        body_T_in_odom = get_se2_a_tform_b(transforms, ODOM_FRAME_NAME, HAND_FRAME_NAME) * body_T_in_hand
+        # # TODO: Don't forget to remove this eventually
+        # arm_stow_command = RobotCommandBuilder.arm_stow_command()
+        # arm_stow_id = command_client.robot_command(arm_stow_command)
+        # time.sleep(0.5)
 
         # now give this to trajectory command to execute the transform
-        body_move_command = RobotCommandBuilder.synchro_se2_trajectory_command(
-            goal_se2=body_T_in_odom.to_proto(), frame_name=ODOM_FRAME_NAME, locomotion_hint=spot_command_pb2.HINT_CRAWL)
-        end_time = 5.0
-        gaze_target_in_odom = body_in_gripper_3d.transform_point(x = 1.5, y = 0, z = 0)
-        gaze_command = RobotCommandBuilder.arm_gaze_command(gaze_target_in_odom[0],
-                                                            gaze_target_in_odom[1],
-                                                            0,
-                                                            ODOM_FRAME_NAME)
-        
-        #follow_arm_command = RobotCommandBuilder.follow_arm_command()
+        body_poses = []
+        arm_poses =[]
+        for cmd_i in range(len(traj_points)):
+            
+            body_end_time = 1.5
+            body_move_command = RobotCommandBuilder.synchro_se2_trajectory_command(
+                goal_se2=traj_points[cmd_i].to_proto(), frame_name=ODOM_FRAME_NAME, locomotion_hint=spot_command_pb2.HINT_CRAWL)
 
-        body_command_id = command_client.robot_command(body_move_command, end_time_secs=time.time() + end_time)
-        #synchro_command = RobotCommandBuilder.build_synchro_command(body_move_command, gaze_command)
-        #synchro_command_id = command_client.robot_command(synchro_command)
-        #block_until_arm_arrives(command_client, synchro_command_id, 5.0)
+            arm_end_time = 1.5
+            arm_pos = arm_points[cmd_i]
+            arm_command = RobotCommandBuilder.arm_pose_command(arm_pos.position.x, arm_pos.position.y, arm_pos.position.z, 
+                                                               arm_pos.rotation.w, arm_pos.rotation.x, arm_pos.rotation.y, arm_pos.rotation.z, 
+                                                               ODOM_FRAME_NAME, arm_end_time)
+            
+            body_command_id = command_client.robot_command(body_move_command, end_time_secs=time.time() + body_end_time)
+            arm_command_id = command_client.robot_command(arm_command)
+
+            transforms = state_client.get_robot_state().kinematic_state.transforms_snapshot
+            body_pos_current = get_se2_a_tform_b(transforms, ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME)
+            arm_pos_current = get_se2_a_tform_b(transforms, ODOM_FRAME_NAME, HAND_FRAME_NAME)
+
+            body_poses.append([body_pos_current.x, body_pos_current.y, body_pos_current.angle])
+            arm_poses.append([arm_pos_current.x, arm_pos_current.y, arm_pos_current.angle])
+            time.sleep(4)
 
         time.sleep(3)
-
+        planned_body_poses = [[p.x, p.y, p.angle] for p in traj_points]
+        plt.figure()
+        plt.scatter(arm_points[0].position.x, arm_points[0].position.y, label='hand')
+        plt.quiver([p[0] for p in planned_body_poses],
+                   [p[1] for p in planned_body_poses],
+                   [np.cos(p[2])*0.05 for p in planned_body_poses],
+                   [np.sin(p[2])*0.05 for p in planned_body_poses], label='planned')
+        plt.quiver([p[0] for p in body_poses],
+                   [p[1] for p in body_poses],
+                   [np.cos(p[2])*0.05 for p in body_poses],
+                   [np.sin(p[2])*0.05 for p in body_poses], label='estimated', color='b')
+        plt.axis("equal")
+        plt.show()
         robot.power_off(cut_immediately=False, timeout_sec=20)
         assert not robot.is_powered_on(), "Robot power off failed."
         robot.logger.info("Robot safely powered off.")
         
-def calculate_traj_angle_points(transforms, angle):
+def calculate_traj_angle_points(hand_roll, hand_pitch, transforms, angle):
     # split the angle into ~ 30 degree angle chunks
     # Returns: a set of body waypoint poses in odom frame
+    # TODO: Make a synchro arm command that also does this
     body_in_gripper = get_se2_a_tform_b(transforms, GRAV_ALIGNED_BODY_FRAME_NAME, HAND_FRAME_NAME).inverse()
 
     traj_points = []
     poses = []
-    sub_angle = pi/6
-    while (sub_angle < angle):
+    arm_poses = []
+    sub_angle = 0
+    while (abs(sub_angle) < abs(angle)):
         traj_points.append(sub_angle)
-        sub_angle += pi/6
+        if angle < 0:
+            sub_angle -= pi/6
+        else:
+            sub_angle += pi/6
     traj_points.append(angle)
     for a in traj_points:
-        dx_body = cos(a) * body_in_gripper.x - sin(a) * body_in_gripper.y
-        dy_body = sin(a) * body_in_gripper.x + cos(a) * body_in_gripper.y
+        try:
+            dx_body = cos(a) * body_in_gripper.x - sin(a) * body_in_gripper.y
+            dy_body = sin(a) * body_in_gripper.x + cos(a) * body_in_gripper.y
 
-        # math_helpers SE2 of change in body pose in hand frame, i.e. body in hand
-        body_T_in_hand = math_helpers.SE2Pose.from_proto(geometry_pb2.SE2Pose(position=geometry_pb2.Vec2(x=dx_body, y=dy_body),angle=a))
+            # math_helpers SE2 of change in body pose in hand frame, i.e. body in hand
+            body_T_in_hand = math_helpers.SE2Pose.from_proto(geometry_pb2.SE2Pose(position=geometry_pb2.Vec2(x=dx_body, y=dy_body),angle=a))
 
-        # SE2 describing body in odom frame by multiplying the grav_odom to grav_hand transform
-        poses.append(get_se2_a_tform_b(transforms, ODOM_FRAME_NAME, HAND_FRAME_NAME) * body_T_in_hand)
-    return poses
-    
+            # SE2 describing body in odom frame by multiplying the grav_odom to grav_hand transform
+            poses.append(get_se2_a_tform_b(transforms, ODOM_FRAME_NAME, HAND_FRAME_NAME) * body_T_in_hand)
+
+            # construct the quaternion for the hand position
+            hand_pose_odom = get_a_tform_b(transforms, ODOM_FRAME_NAME, HAND_FRAME_NAME)
+            current_hand_rot_odom = math_helpers.quat_to_eulerZYX(hand_pose_odom.rotation)
+            # hand rpy relative to the odom frame
+            hand_rpy_euler = geometry.EulerZXY(roll=hand_roll,pitch=hand_pitch,yaw=a+current_hand_rot_odom[0])
+            hand_goal_odom = geometry_pb2.SE3Pose(position=hand_pose_odom.position, rotation=hand_rpy_euler.to_quaternion())
+            arm_poses.append(hand_goal_odom)
+        except:
+            exit(1)
+    return poses, arm_poses
 
 def main(argv):
     parser = argparse.ArgumentParser()
