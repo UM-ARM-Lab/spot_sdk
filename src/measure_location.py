@@ -1,6 +1,7 @@
 import argparse
 import sys
 import time
+from math import sqrt
 
 import bosdyn.client
 import bosdyn.client.util
@@ -49,7 +50,6 @@ def measure(config):
             transforms_map = world_obj.transforms_snapshot
     # TODO: Examine why I need to compute transforms manually when using a world object transforms snapshot
     start_location_in_odom = get_se2_a_tform_b(transforms_map, ODOM_FRAME_NAME, "map_frame").inverse() * get_se2_a_tform_b(transforms, ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME)
-    print(start_location_in_odom)
     xo = start_location_in_odom.x
     yo = start_location_in_odom.y
     tho = start_location_in_odom.angle
@@ -68,8 +68,10 @@ def measure(config):
         dispx = body_pos_current.x - xo
         dispy = body_pos_current.y - yo
         dispth = body_pos_current.angle - tho
+        dist = sqrt(dispx**2 + dispy**2) 
 
         print("map frame dist x: ", f'{dispx:.3f}', "y: ", f'{dispy:.3f}', "th: ", f'{dispth:.3f}')
+        print("distance to origin: ", f'{dist:.3f}')
         
 
 def main(argv):
