@@ -44,8 +44,12 @@ def go_to_origin(config):
         robot.logger.info("Robot standing.")
 
         # now give this to trajectory command to execute the transform
+        transforms = state_client.get_robot_state().kinematic_state.transforms_snapshot
+        current_heading = get_se2_a_tform_b(transforms, ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME).angle
+        transforms = state_client.get_robot_state().kinematic_state.transforms_snapshot
+        
         body_move_command = RobotCommandBuilder.synchro_se2_trajectory_point_command(
-            goal_x=2, goal_y=0, goal_heading=0, frame_name=ODOM_FRAME_NAME, locomotion_hint=spot_command_pb2.HINT_CRAWL)
+            goal_x=2, goal_y=0, goal_heading=current_heading, frame_name=ODOM_FRAME_NAME, locomotion_hint=spot_command_pb2.HINT_CRAWL)
         end_time = 5.0
         body_command_id = command_client.robot_command(body_move_command, end_time_secs=time.time() + end_time)
         time.sleep(3)
