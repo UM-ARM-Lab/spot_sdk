@@ -79,7 +79,7 @@ class EstopGui(QtWidgets.QMainWindow):
 
         self.stop_button = QtWidgets.QPushButton(self)
         self.stop_button.setText('STOP')
-        self.stop_button.clicked.connect(self.estop_keep_alive.stop)
+        self.stop_button.clicked.connect(self.estop_keep_alive.settle_then_cut)
         self.stop_button.setStyleSheet(STOP_BUTTON_STYLESHEET)
         self.stop_button.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
                                        QtWidgets.QSizePolicy.Expanding)

@@ -5,6 +5,8 @@ from math import pi, sin, cos
 import matplotlib.pyplot as plt
 import numpy as np
 
+import go_to_point
+
 import bosdyn.client
 import bosdyn.client.lease
 import bosdyn.client.util
@@ -60,7 +62,7 @@ def rotate_around_arm(config):
         ###### begin trajectory for deploying arm close to ground ####
 
         # Final position of the gripper relative to the gravity aligned body frmae
-        x = 0.9
+        x = 0.75
         y = 0
         z = -0.25
 
@@ -116,7 +118,7 @@ def rotate_around_arm(config):
         transforms = state_client.get_robot_state().kinematic_state.transforms_snapshot
 
         # theta that the body must rotate in radians
-        theta = -pi/2
+        theta = pi
 
         traj_points, arm_points = calculate_traj_angle_points(r, p, transforms, theta)
 
@@ -128,13 +130,13 @@ def rotate_around_arm(config):
         # now give this to trajectory command to execute the transform
         body_poses = []
         arm_poses =[]
-        for cmd_i in range(len(traj_points)):
+        for cmd_i in range(1,len(traj_points)):
             
-            body_end_time = 1.5
+            body_end_time = 4.5
             body_move_command = RobotCommandBuilder.synchro_se2_trajectory_command(
                 goal_se2=traj_points[cmd_i].to_proto(), frame_name=ODOM_FRAME_NAME, locomotion_hint=spot_command_pb2.HINT_CRAWL)
 
-            arm_end_time = 1.5
+            arm_end_time = 4
             arm_pos = arm_points[cmd_i]
             arm_command = RobotCommandBuilder.arm_pose_command(arm_pos.position.x, arm_pos.position.y, arm_pos.position.z, 
                                                                arm_pos.rotation.w, arm_pos.rotation.x, arm_pos.rotation.y, arm_pos.rotation.z, 
@@ -149,22 +151,24 @@ def rotate_around_arm(config):
 
             body_poses.append([body_pos_current.x, body_pos_current.y, body_pos_current.angle])
             arm_poses.append([arm_pos_current.x, arm_pos_current.y, arm_pos_current.angle])
-            time.sleep(4)
+            time.sleep(4.0)
 
         time.sleep(3)
-        planned_body_poses = [[p.x, p.y, p.angle] for p in traj_points]
-        plt.figure()
-        plt.scatter(arm_points[0].position.x, arm_points[0].position.y, label='hand')
-        plt.quiver([p[0] for p in planned_body_poses],
-                   [p[1] for p in planned_body_poses],
-                   [np.cos(p[2])*0.05 for p in planned_body_poses],
-                   [np.sin(p[2])*0.05 for p in planned_body_poses], label='planned')
-        plt.quiver([p[0] for p in body_poses],
-                   [p[1] for p in body_poses],
-                   [np.cos(p[2])*0.05 for p in body_poses],
-                   [np.sin(p[2])*0.05 for p in body_poses], label='estimated', color='b')
-        plt.axis("equal")
-        plt.show()
+        # planned_body_poses = [[p.x, p.y, p.angle] for p in traj_points]
+        # plt.figure()
+        # plt.scatter(arm_points[0].position.x, arm_points[0].position.y, label='hand')
+        # plt.quiver([p[0] for p in planned_body_poses],
+        #            [p[1] for p in planned_body_poses],
+        #            [np.cos(p[2])*0.05 for p in planned_body_poses],
+        #            [np.sin(p[2])*0.05 for p in planned_body_poses], label='planned')
+        # plt.quiver([p[0] for p in body_poses],
+        #            [p[1] for p in body_poses],
+        #            [np.cos(p[2])*0.05 for p in body_poses],
+        #            [np.sin(p[2])*0.05 for p in body_poses], label='estimated', color='b')
+        # plt.axis("equal")
+        # plt.show()
+        drag_pos = math_helpers.SE2Pose(x=-1.5, y=0, angle=0)
+        go_to_point.go_to_point(lease_client, robot, command_client, state_client, drag_pos)
         robot.power_off(cut_immediately=False, timeout_sec=20)
         assert not robot.is_powered_on(), "Robot power off failed."
         robot.logger.info("Robot safely powered off.")
