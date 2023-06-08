@@ -58,7 +58,7 @@ def force_measure(state_client):
     rr.log_scalar("force/z", force_reading.z)
     # runningSum = runningSum - forceQueue.popleft() + force_reading.z
     # forceQueue.append(force_reading.z)
-    if abs(force_reading.z) > 22:
+    if abs(force_reading.z) > 15:
         # print(runningSum)
         print("large z force detected!",force_reading.z)
         return True
@@ -92,6 +92,7 @@ def drag_rope_to_pose(robot, robot_state_client, command_client, se2pose, frame_
             hand_in_odom.rot.y, hand_in_odom.rot.z, ODOM_FRAME_NAME, seconds)
 
         command = RobotCommandBuilder.build_synchro_command(arm_command)
+        arm_cmd_id = command_client.robot_command(command)
         time.sleep(0.5)
 
         # lock hand in body until the desired pose is reached or the force sensor detects a high force
@@ -117,11 +118,41 @@ def drag_rope_to_pose(robot, robot_state_client, command_client, se2pose, frame_
                 return False
             time.sleep(0.25)   
 
-def arm_pickup(robot, image_client, manipulation_api_client):
+def arm_pickup(robot, robot_state_client, image_client, command_client, manipulation_api_client):
+        transforms = robot_state_client.get_robot_state().kinematic_state.transforms_snapshot
+
+        x = 0.75
+        y = 0
+        z = -0.1
+        r = 0
+        p = 1.3
+        y = 0
+
+        hand_pos_in_body = geometry_pb2.Vec3(x=x,y=y,z=z)
+
+        euler = geometry.EulerZXY(roll=r,pitch=p,yaw=y)
+        quat_hand=euler.to_quaternion()
+
+        body_in_odom = get_a_tform_b(transforms, ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME)
+        hand_in_body = geometry_pb2.SE3Pose(position=hand_pos_in_body, rotation=quat_hand)
+
+        hand_in_odom = body_in_odom * math_helpers.SE3Pose.from_proto(hand_in_body)
+
+        # duration in seconds
+        seconds = 0.5
+
+        arm_command = RobotCommandBuilder.arm_pose_command(
+            hand_in_odom.x, hand_in_odom.y, hand_in_odom.z, hand_in_odom.rot.w, hand_in_odom.rot.x,
+            hand_in_odom.rot.y, hand_in_odom.rot.z, ODOM_FRAME_NAME, seconds)
+
+        command = RobotCommandBuilder.build_synchro_command(arm_command)
+        arm_cmd_id = command_client.robot_command(command)
+        time.sleep(2)
+
         ### Take picture and get point ###
 
-        robot.logger.info('Getting an image from: frontleft_fisheye_image')
-        image_responses = image_client.get_image_from_sources(["frontleft_fisheye_image"])
+        robot.logger.info('Getting an image from: hand_color_image')
+        image_responses = image_client.get_image_from_sources(["hand_color_image"])
 
         if len(image_responses) != 1:
             print('Got invalid number of images: ' + str(len(image_responses)))
@@ -246,7 +277,7 @@ def arm_pull_rope(config):
         stuck_pose_in_odom = get_se2_a_tform_b(transforms, ODOM_FRAME_NAME,GRAV_ALIGNED_BODY_FRAME_NAME) * stuck_pose_in_body
 
         # goal pose
-        goal_pose_in_body = math_helpers.SE2Pose(x=-1, y=-2.0,angle=0)
+        goal_pose_in_body = math_helpers.SE2Pose(x=-0.7, y=-0.5,angle=0)
         goal_pose_in_odom = get_se2_a_tform_b(transforms, ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME) * goal_pose_in_body
 
         end_time = 4.0
@@ -257,7 +288,7 @@ def arm_pull_rope(config):
         # time.sleep(end_time + 1.5)
 
         #### Pickup hose ###
-        arm_pickup(robot=robot, image_client=image_client, manipulation_api_client=manipulation_api_client)
+        arm_pickup(robot=robot, robot_state_client=robot_state_client, image_client=image_client, command_client=command_client, manipulation_api_client=manipulation_api_client)
 
         ### start dragging hose toward the goal pose ###
 
