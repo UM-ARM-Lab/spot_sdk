@@ -31,6 +31,33 @@ from collections import deque
 g_image_click = None
 g_image_display = None
 
+def hand_gaze_ground_command(robot_state_client, height):
+    transforms = robot_state_client.get_robot_state().kinematic_state.transforms_snapshot
+
+    x = 0.75
+    y = 0
+    z = height
+    r = 0
+    p = 1.57
+    y = 0
+
+    hand_pos_in_body = geometry_pb2.Vec3(x=x,y=y,z=z)
+
+    euler = geometry.EulerZXY(roll=r,pitch=p,yaw=y)
+    quat_hand=euler.to_quaternion()
+
+    body_in_odom = get_a_tform_b(transforms, ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME)
+    hand_in_body = geometry_pb2.SE3Pose(position=hand_pos_in_body, rotation=quat_hand)
+
+    hand_in_odom = body_in_odom * math_helpers.SE3Pose.from_proto(hand_in_body)
+
+    # duration in seconds
+    seconds = 0.5
+
+    arm_command = RobotCommandBuilder.arm_pose_command(
+        hand_in_odom.x, hand_in_odom.y, hand_in_odom.z, hand_in_odom.rot.w, hand_in_odom.rot.x,
+        hand_in_odom.rot.y, hand_in_odom.rot.z, ODOM_FRAME_NAME, seconds)
+    return arm_command
 
 def cv_mouse_callback(event, x, y, flags, param):
     global g_image_click, g_image_display
@@ -49,7 +76,7 @@ def cv_mouse_callback(event, x, y, flags, param):
         cv2.line(clone, (x, 0), (x, height), color, thickness)
         cv2.imshow(image_title, clone)
 
-def force_measure(state_client):
+def force_measure(state_client, command_client):
     state = state_client.get_robot_state()
     manip_state = state.manipulator_state
     force_reading = manip_state.estimated_end_effector_force_in_hand
@@ -61,38 +88,14 @@ def force_measure(state_client):
     if abs(force_reading.z) > 15:
         # print(runningSum)
         print("large z force detected!",force_reading.z)
+        stop_cmd = RobotCommandBuilder.stop_command()
+        stop_cmd_id = command_client.robot_command(stop_cmd)
         return True
     return False
 
 def drag_rope_to_pose(robot, robot_state_client, command_client, se2pose, frame_name):
-        transforms = robot_state_client.get_robot_state().kinematic_state.transforms_snapshot
-
-        x = 0.75
-        y = 0
-        z = -0.1
-        r = 0
-        p = 1.57
-        y = 0
-
-        hand_pos_in_body = geometry_pb2.Vec3(x=x,y=y,z=z)
-
-        euler = geometry.EulerZXY(roll=r,pitch=p,yaw=y)
-        quat_hand=euler.to_quaternion()
-
-        body_in_odom = get_a_tform_b(transforms, ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME)
-        hand_in_body = geometry_pb2.SE3Pose(position=hand_pos_in_body, rotation=quat_hand)
-
-        hand_in_odom = body_in_odom * math_helpers.SE3Pose.from_proto(hand_in_body)
-
-        # duration in seconds
-        seconds = 0.5
-
-        arm_command = RobotCommandBuilder.arm_pose_command(
-            hand_in_odom.x, hand_in_odom.y, hand_in_odom.z, hand_in_odom.rot.w, hand_in_odom.rot.x,
-            hand_in_odom.rot.y, hand_in_odom.rot.z, ODOM_FRAME_NAME, seconds)
-
-        command = RobotCommandBuilder.build_synchro_command(arm_command)
-        arm_cmd_id = command_client.robot_command(command)
+        look_ground_command = RobotCommandBuilder.build_synchro_command(hand_gaze_ground_command(robot_state_client, height=-0.1))
+        arm_cmd_id = command_client.robot_command(look_ground_command)
         time.sleep(0.5)
 
         # lock hand in body until the desired pose is reached or the force sensor detects a high force
@@ -119,34 +122,8 @@ def drag_rope_to_pose(robot, robot_state_client, command_client, se2pose, frame_
             time.sleep(0.25)   
 
 def arm_pickup(robot, robot_state_client, image_client, command_client, manipulation_api_client):
-        transforms = robot_state_client.get_robot_state().kinematic_state.transforms_snapshot
-
-        x = 0.75
-        y = 0
-        z = -0.1
-        r = 0
-        p = 1.3
-        y = 0
-
-        hand_pos_in_body = geometry_pb2.Vec3(x=x,y=y,z=z)
-
-        euler = geometry.EulerZXY(roll=r,pitch=p,yaw=y)
-        quat_hand=euler.to_quaternion()
-
-        body_in_odom = get_a_tform_b(transforms, ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME)
-        hand_in_body = geometry_pb2.SE3Pose(position=hand_pos_in_body, rotation=quat_hand)
-
-        hand_in_odom = body_in_odom * math_helpers.SE3Pose.from_proto(hand_in_body)
-
-        # duration in seconds
-        seconds = 0.5
-
-        arm_command = RobotCommandBuilder.arm_pose_command(
-            hand_in_odom.x, hand_in_odom.y, hand_in_odom.z, hand_in_odom.rot.w, hand_in_odom.rot.x,
-            hand_in_odom.rot.y, hand_in_odom.rot.z, ODOM_FRAME_NAME, seconds)
-
-        command = RobotCommandBuilder.build_synchro_command(arm_command)
-        arm_cmd_id = command_client.robot_command(command)
+        look_ground_command = RobotCommandBuilder.build_synchro_command(hand_gaze_ground_command(robot_state_client, height=-0.1))
+        arm_cmd_id = command_client.robot_command(look_ground_command)
         time.sleep(2)
 
         ### Take picture and get point ###
@@ -229,8 +206,6 @@ def arm_pickup(robot, robot_state_client, image_client, command_client, manipula
         robot.logger.info('Finished grasp.')
             
 def arm_pull_rope(config):
-    """Applies force to the gripper so it remains stationary. If force surpasses a certain limit, flash the LEDs red"""
-
     bosdyn.client.util.setup_logging(config.verbose)
 
     # Creates client, robot, and authenticates, and time syncs
@@ -272,37 +247,73 @@ def arm_pull_rope(config):
         hose_start_in_body = math_helpers.SE2Pose(x=1.2,y=0,angle=0)
         hose_start_in_odom = get_se2_a_tform_b(transforms, ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME) * hose_start_in_body
 
-        # pose to unstick
+        # pose to unstick (3)
         stuck_pose_in_body = math_helpers.SE2Pose(x=2.5,y=0,angle=0)
         stuck_pose_in_odom = get_se2_a_tform_b(transforms, ODOM_FRAME_NAME,GRAV_ALIGNED_BODY_FRAME_NAME) * stuck_pose_in_body
 
-        # goal pose
+        # goal pose (4)
         goal_pose_in_body = math_helpers.SE2Pose(x=-0.7, y=-0.5,angle=0)
         goal_pose_in_odom = get_se2_a_tform_b(transforms, ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME) * goal_pose_in_body
 
-        end_time = 4.0
-
         body_move_to_hose_start_cmd = RobotCommandBuilder.synchro_se2_trajectory_command(goal_se2=hose_start_in_odom.to_proto(), frame_name=ODOM_FRAME_NAME, locomotion_hint= spot_command_pb2.HINT_CRAWL)
-        # move_to_hose_id = command_client.robot_command(body_move_to_hose_start_cmd, end_time_secs=time.time() + end_time)
+        # move_to_hose_id = command_client.robot_command(body_move_to_hose_start_cmd)
         
         # time.sleep(end_time + 1.5)
 
         #### Pickup hose ###
-        arm_pickup(robot=robot, robot_state_client=robot_state_client, image_client=image_client, command_client=command_client, manipulation_api_client=manipulation_api_client)
+        arm_pickup(robot=robot, image_client=image_client, manipulation_api_client=manipulation_api_client)
 
         ### start dragging hose toward the goal pose ###
+        if (not drag_rope_to_pose(robot, robot_state_client,command_client, goal_pose_in_odom, ODOM_FRAME_NAME)):
+            # walk forward a little bit and put the hose down 
+            transforms = robot_state_client.get_robot_state().kinematic_state.transforms_snapshot
+            decrease_tension_in_body = math_helpers.SE2Pose(x=0.3,y=0,angle=0)
+            decrease_tension_in_odom = get_se2_a_tform_b(transforms, ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME) * decrease_tension_in_body
+            body_move_decrease_tension_cmd = RobotCommandBuilder.synchro_se2_trajectory_command(goal_se2=decrease_tension_in_odom.to_proto(), frame_name=ODOM_FRAME_NAME, locomotion_hint=spot_command_pb2.HINT_CRAWL)
 
-        drag_rope_to_pose(robot, robot_state_client,command_client, goal_pose_in_odom, ODOM_FRAME_NAME)
+            lower_hand_cmd = hand_gaze_ground_command(robot_state_client, -0.1)
+            decrease_tension_synchro_cmd = RobotCommandBuilder.build_synchro_command(lower_hand_cmd, body_move_decrease_tension_cmd)
+            decrease_tension_id = command_client.robot_command(decrease_tension_synchro_cmd)  
 
-        # Open the gripper
-        gripper_open = RobotCommandBuilder.claw_gripper_open_fraction_command(0.5)
-        gripper_open_command_id = command_client.robot_command(gripper_open)
+            open_gripper_cmd = RobotCommandBuilder.claw_gripper_open_command()
+            gripper_open_command_id = command_client.robot_command(open_gripper_cmd)
+            # now, the hose shouldn't snap back or move around
+            # save the current position of the robot in odom frame to come back to
+            transforms = robot_state_client.get_robot_state().kinematic_state.transforms_snapshot
 
-        robot.logger.info("Open gripper command issued.")
-        block_until_arm_arrives(command_client, gripper_open_command_id, 3.0)
-        
-        # Wait 2 seconds to let a user put in a rope or something like that
-        time.sleep(2.0)
+            hose_pose_in_odom = get_se2_a_tform_b(transforms, ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME)
+
+            #### Regrasp ####
+            
+            # walk to position where hose is stuck
+            body_move_to_stuck_pos_cmd = RobotCommandBuilder.synchro_se2_trajectory_command(goal_se2=stuck_pose_in_odom.to_proto(), frame_name=ODOM_FRAME_NAME, locomotion_hint=spot_command_pb2.HINT_CRAWL)
+            hand_move_to_stuck_pos_cmd = hand_gaze_ground_command(robot_state_client, 0.2)
+            move_to_stuck_pos_synchro_cmd = command_client.robot_command(body_move_to_stuck_pos_cmd, hand_move_to_stuck_pos_cmd)
+            move_to_stuck_pos_id = command_client.robot_command(decrease_tension_synchro_cmd)
+            
+            # pickup hose
+            arm_pickup(robot=robot, robot_state_client=robot_state_client, image_client=image_client, command_client=command_client, manipulation_api_client=manipulation_api_client)
+
+            # walk backward a little bit then put the hose down
+            transforms = robot_state_client.get_robot_state().kinematic_state.transforms_snapshot
+            put_down_hose_in_body = math_helpers.SE2Pose(x=-0.3,y=0,angle=0)
+            put_down_hose_in_odom = get_se2_a_tform_b(transforms, ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME) * decrease_tension_in_body
+            body_move_decrease_tension_cmd = RobotCommandBuilder.synchro_se2_trajectory_command(goal_se2=put_down_hose_in_odom.to_proto(), frame_name=ODOM_FRAME_NAME, locomotion_hint=spot_command_pb2.HINT_CRAWL)
+
+            unstick_hose_cmd = RobotCommandBuilder.build_synchro_command(body_move_decrease_tension_cmd, lower_hand_cmd)
+            unstick_hose_cmd_id = command_client.robot_command(unstick_hose_cmd)
+
+            gripper_open_command_id = command_client.robot_command(open_gripper_cmd)
+            
+            #redrag 
+
+    # Open the gripper
+    gripper_open_command_id = command_client.robot_command(open_gripper_cmd)
+
+    robot.logger.info("Open gripper command issued.")
+    block_until_arm_arrives(command_client, gripper_open_command_id, 3.0)
+    
+    time.sleep(2.0)
 
 def main(argv):
     pass
