@@ -14,6 +14,7 @@ from bosdyn.client.frame_helpers import ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME
 from bosdyn.client import math_helpers
 
 from bosdyn.client.robot_state import RobotStateClient
+from bosdyn.client.image import ImageClient
 from bosdyn.client.manipulation_api_client import ManipulationApiClient
 from bosdyn.client.robot_command import (RobotCommandBuilder, RobotCommandClient, blocking_stand, block_until_arm_arrives)
 from bosdyn.util import seconds_to_duration
@@ -27,6 +28,9 @@ from collections import deque
 
 # global forceQueue
 # global runningSum
+g_image_click = None
+g_image_display = None
+
 
 def cv_mouse_callback(event, x, y, flags, param):
     global g_image_click, g_image_display
@@ -54,7 +58,7 @@ def force_measure(state_client):
     rr.log_scalar("force/z", force_reading.z)
     # runningSum = runningSum - forceQueue.popleft() + force_reading.z
     # forceQueue.append(force_reading.z)
-    if abs(force_reading.z) > 25:
+    if abs(force_reading.z) > 22:
         # print(runningSum)
         print("large z force detected!",force_reading.z)
         return True
@@ -92,7 +96,7 @@ def drag_rope_to_pose(robot, robot_state_client, command_client, se2pose, frame_
 
         # lock hand in body until the desired pose is reached or the force sensor detects a high force
 
-        robot_cmd = RobotCommandBuilder.synchro_se2_trajectory_command(goal_se2=se2pose, frame_name=frame_name)
+        robot_cmd = RobotCommandBuilder.synchro_se2_trajectory_command(goal_se2=se2pose.to_proto(), frame_name=frame_name, locomotion_hint=spot_command_pb2.HINT_CRAWL)
         end_time = 10
         walk_cmd_id = command_client.robot_command(lease=None, command=robot_cmd, end_time_secs=time.time() + end_time)
 
@@ -164,6 +168,8 @@ def arm_pickup(robot, image_client, manipulation_api_client):
 
         # Add squeeze grasp constraint
 
+        grasp.grasp_params.grasp_params_frame_name = ODOM_FRAME_NAME
+
         constraint = grasp.grasp_params.allowable_orientation.add()
         constraint.squeeze_grasp.SetInParent()
 
@@ -210,7 +216,9 @@ def arm_pull_rope(config):
     lease_client = robot.ensure_client(bosdyn.client.lease.LeaseClient.default_service_name)
     robot_state_client = robot.ensure_client(RobotStateClient.default_service_name)
     manipulation_api_client = robot.ensure_client(ManipulationApiClient.default_service_name)
-    image_client = robot.ensure_client(ManipulationApiClient.default_service_name)
+    image_client = robot.ensure_client(ImageClient.default_service_name)
+
+    lease_client.take()
 
     with (bosdyn.client.lease.LeaseKeepAlive(lease_client, must_acquire=True, return_at_exit=True)):
 
@@ -230,24 +238,26 @@ def arm_pull_rope(config):
 
         #### poses for all the points ####
         # initial hose position (1)
-        hose_start_in_body = math_helpers.SE2Pose(x=1.5,y=0,angle=0)
+        hose_start_in_body = math_helpers.SE2Pose(x=1.2,y=0,angle=0)
         hose_start_in_odom = get_se2_a_tform_b(transforms, ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME) * hose_start_in_body
 
         # pose to unstick
-        stuck_pose_in_body = math_helpers.SE2Pose(x=4.0,y =-0.5,angle=0)
+        stuck_pose_in_body = math_helpers.SE2Pose(x=2.5,y=0,angle=0)
         stuck_pose_in_odom = get_se2_a_tform_b(transforms, ODOM_FRAME_NAME,GRAV_ALIGNED_BODY_FRAME_NAME) * stuck_pose_in_body
 
         # goal pose
-        goal_pose_in_body = math_helpers.SE2Pose(x=4.0, y=-3.0,angle=0)
+        goal_pose_in_body = math_helpers.SE2Pose(x=-1, y=-2.0,angle=0)
         goal_pose_in_odom = get_se2_a_tform_b(transforms, ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME) * goal_pose_in_body
 
         end_time = 4.0
 
-        body_move_to_hose_start_cmd = RobotCommandBuilder.synchro_se2_trajectory_command(goal_se2=hose_start_in_odom, frame_name=ODOM_FRAME_NAME, locomotion_hint= spot_command_pb2.HINT_CRAWL)
-        move_to_hose_id = command_client.robot_command(body_move_to_hose_start_cmd, end_time_secs=time.time() + end_time)
+        body_move_to_hose_start_cmd = RobotCommandBuilder.synchro_se2_trajectory_command(goal_se2=hose_start_in_odom.to_proto(), frame_name=ODOM_FRAME_NAME, locomotion_hint= spot_command_pb2.HINT_CRAWL)
+        # move_to_hose_id = command_client.robot_command(body_move_to_hose_start_cmd, end_time_secs=time.time() + end_time)
         
+        # time.sleep(end_time + 1.5)
+
         #### Pickup hose ###
-        arm_pickup(robot, image_client=image_client, manipulation_api_client=manipulation_api_client)
+        arm_pickup(robot=robot, image_client=image_client, manipulation_api_client=manipulation_api_client)
 
         ### start dragging hose toward the goal pose ###
 
