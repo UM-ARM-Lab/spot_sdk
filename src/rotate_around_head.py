@@ -167,6 +167,8 @@ def rotate_around_arm(config):
         #            [np.sin(p[2])*0.05 for p in body_poses], label='estimated', color='b')
         # plt.axis("equal")
         # plt.show()
+        # Maybe do a synchro arm and body command?
+        # have an arm pos in the body frame now instead of odom frame
         drag_pos = math_helpers.SE2Pose(x=-1.5, y=0, angle=0)
         go_to_point.go_to_point(lease_client, robot, command_client, state_client, drag_pos)
         robot.power_off(cut_immediately=False, timeout_sec=20)

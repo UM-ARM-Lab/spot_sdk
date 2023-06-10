@@ -87,7 +87,7 @@ def main(argv):
 
     # Write the image out.
     filename = options.camera + ".jpg"
-    cv2.imwrite(filename, out)
+    cv2.imwrite(filename, visual_rgb)
 
     return True
 

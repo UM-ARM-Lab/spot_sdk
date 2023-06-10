@@ -279,8 +279,10 @@ class GraphNavInterface(object):
             # Issue the navigation command about twice a second such that it is easy to terminate the
             # navigation command (with estop or killing the program).
             try:
+                #travel_params = graph_nav_pb2.TravelParams(ignore_final_yaw=False)
+                travel_params = graph_nav_pb2.TravelParams(ignore_final_yaw=True)
                 nav_to_cmd_id = self._graph_nav_client.navigate_to(destination_waypoint, 1.0,
-                                                                   command_id=nav_to_cmd_id)
+                                                                   command_id=nav_to_cmd_id, travel_params=travel_params)
             except ResponseError as e:
                 print("Error while navigating {}".format(e))
                 break
@@ -337,8 +339,10 @@ class GraphNavInterface(object):
             while not is_finished:
                 # Issue the route command about twice a second such that it is easy to terminate the
                 # navigation command (with estop or killing the program).
+                # travel_params = graph_nav_pb2.TravelParams(ignore_final_yaw=False)
+                travel_params = graph_nav_pb2.TravelParams(ignore_final_yaw=True)
                 nav_route_command_id = self._graph_nav_client.navigate_route(
-                    route, cmd_duration=1.0)
+                    route, cmd_duration=1.0,travel_params=travel_params)
                 time.sleep(.5)  # Sleep for half a second to allow for command execution.
                 # Poll the robot for feedback to determine if the route is complete. Then sit
                 # the robot down once it is finished.

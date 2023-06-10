@@ -22,7 +22,7 @@ from bosdyn.client.estop import EstopClient
 from bosdyn.client.frame_helpers import VISION_FRAME_NAME, get_vision_tform_body, math_helpers
 from bosdyn.client.image import ImageClient
 from bosdyn.client.manipulation_api_client import ManipulationApiClient
-from bosdyn.client.robot_command import RobotCommandClient, blocking_stand
+from bosdyn.client.robot_command import RobotCommandBuilder, RobotCommandClient, blocking_stand
 from bosdyn.client.robot_state import RobotStateClient
 
 g_image_click = None
@@ -156,6 +156,9 @@ def arm_object_grasp(config):
             time.sleep(0.25)
 
         robot.logger.info('Finished grasp.')
+
+        ready = RobotCommandBuilder.arm_ready_command()
+        ready_cmd_id = command_client.robot_command(ready)
         time.sleep(4.0)
 
         robot.logger.info('Sitting down and turning off.')

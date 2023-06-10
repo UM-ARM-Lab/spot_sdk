@@ -3,6 +3,8 @@ import sys
 import time
 from math import pi, sin, cos
 
+import create_map_frame
+
 import bosdyn.client
 import bosdyn.client.lease
 import bosdyn.client.util
@@ -16,64 +18,37 @@ from bosdyn.client.power import PowerClient
 from bosdyn.client.world_object import WorldObjectClient
 from bosdyn import geometry
 
-def go_to_origin(config):
-    print("hello world")
-    bosdyn.client.util.setup_logging()
-    sdk = bosdyn.client.create_standard_sdk("SpotClient")
-
-    robot = sdk.create_robot(config.hostname)
-    bosdyn.client.util.authenticate(robot)
-    robot.time_sync.wait_for_sync()
+def go_to_point(lease_client, robot, command_client, state_client, se2pose):
     assert not robot.is_estopped(),"Robot is estopped. Please use an external E-Stop client, " \
                                     "such as the estop SDK example, to configure E-Stop."
     
-    lease_client = robot.ensure_client(bosdyn.client.lease.LeaseClient.default_service_name)
-
     with bosdyn.client.lease.LeaseKeepAlive(lease_client, must_acquire=True, return_at_exit=True):
-        robot.logger.info("Powering on robot... This may take several seconds.")
-        robot.power_on(timeout_sec=20)
-        assert robot.is_powered_on(), "Robot power on failed."
-        robot.logger.info("Robot powered on.")
-
-        robot.logger.info("Commanding robot to stand...")
-
-        command_client = robot.ensure_client(RobotCommandClient.default_service_name)
-        state_client = robot.ensure_client(RobotStateClient.default_service_name)
-        
+        # Construct "global" map frame
+        transforms_map = create_map_frame.create_map_frame(robot, state_client)
+        transforms = state_client.get_robot_state().kinematic_state.transforms_snapshot
         blocking_stand(command_client, timeout_sec=10)
         robot.logger.info("Robot standing.")
-
-        # now give this to trajectory command to execute the transform
-        transforms = state_client.get_robot_state().kinematic_state.transforms_snapshot
-        current_heading = get_se2_a_tform_b(transforms, ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME).angle
-        transforms = state_client.get_robot_state().kinematic_state.transforms_snapshot
         
-        body_move_command = RobotCommandBuilder.synchro_se2_trajectory_point_command(
-            goal_x=2, goal_y=0, goal_heading=current_heading, frame_name=ODOM_FRAME_NAME, locomotion_hint=spot_command_pb2.HINT_CRAWL)
-        end_time = 5.0
-        body_command_id = command_client.robot_command(body_move_command, end_time_secs=time.time() + end_time)
-        time.sleep(3)
+        # goal of body in map
+        goal_in_body = math_helpers.SE2Pose(x=1.5, y=0, angle=0)
+        goal_in_odom = get_se2_a_tform_b(transforms, ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME) * goal_in_body 
+        end_time = 6.0
+        body_move_command = RobotCommandBuilder.synchro_se2_trajectory_command(goal_se2=math_helpers.SE2Pose.to_proto(se2pose), frame_name=ODOM_FRAME_NAME, locomotion_hint=spot_command_pb2.HINT_CRAWL)
+        hand_pos = get_a_tform_b(transforms, GRAV_ALIGNED_BODY_FRAME_NAME, HAND_FRAME_NAME)
+        arm_move_command = RobotCommandBuilder.arm_pose_command(x=hand_pos.position.x, y=hand_pos.position.y, z=hand_pos.position.z, qw=hand_pos.rotation.w, qx=hand_pos.rotation.x, qy=hand_pos.rotation.y, qz=hand_pos.rotation.z,frame_name=GRAV_ALIGNED_BODY_FRAME_NAME,seconds=end_time)
+        synchro_command = RobotCommandBuilder.build_synchro_command(arm_move_command, body_move_command)
+        synchro_command_id = command_client.robot_command(synchro_command, end_time_secs=time.time() + end_time) 
 
-        robot.power_off(cut_immediately=False, timeout_sec=20)
-        assert not robot.is_powered_on(), "Robot power off failed."
-        robot.logger.info("Robot safely powered off.")
-        
+        # send arm trajectory too
+        bring_arm_to_point(lease_client,robot,command_client,state_client, se2pose)
+        time.sleep(9)
 
-        
+def bring_arm_to_point(lease_client, robot, command_client, state_client, pose_to_follow, end_time):
+    assert not robot.is_estopped()
+    transforms = state_client.get_root_state().kinematic_state.transforms_snapshot
+    body_in_odom = get_se2_a_tform_b(transforms, ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME)
+    hand_in_body = get_a_tform_b(transforms, GRAV_ALIGNED_BODY_FRAME_NAME, HAND_FRAME_NAME)
 
-def main(argv):
-    parser = argparse.ArgumentParser()
-    # adds hostname to parser
-    bosdyn.client.util.add_base_arguments(parser)
-    options = parser.parse_args(argv)
-    try:
-        go_to_origin(options)
-        return True
-    except Exception as exc:
-        logger = bosdyn.client.util.get_logger()
-        logger.exception("Threw an exception")
-        return False
-
-if __name__ == '__main__':
-    if not main(sys.argv[1:]):
-        sys.exit(1)
+    # keep the current body to hand transform and just map it to a trajectory
+    hand_move_command = RobotCommandBuilder.synchro_se2_trajectory_command*(goal_se2=math_helpers.SE2Pose.to)
+    
