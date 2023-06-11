@@ -4,7 +4,7 @@ This script shows how to detect the grasp point in an image using the segmentati
 The basic algorithm is:
 1. Load the image and the predictions from the model
 2. Find candidate points, which are points on the rope that are near but not inside an obstacle
-3. Find the candidate point that is closest to the center of the image
+3. Find the candidate point that is closest to the bottom center of the image (closest to the robot)
 
 Within a larger script, you might use it like this:
 
@@ -73,8 +73,6 @@ def main():
                 zorder=3)
     plt.legend()
     plt.show()
-
-    print(grasp_px)
 
 
 def detect_regrasp_point(model, test_image_filename):

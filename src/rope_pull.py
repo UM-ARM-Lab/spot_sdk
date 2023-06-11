@@ -26,6 +26,8 @@ from bosdyn.client.robot_command import (RobotCommandBuilder, RobotCommandClient
 from bosdyn.client.robot_state import RobotStateClient
 from google.protobuf import wrappers_pb2
 
+from src.video_recording import VideoRecorder, live_view
+
 FORCE_BUFFER_SIZE = 15
 
 g_image_click = None
@@ -142,14 +144,14 @@ def force_measure(state_client, command_client, force_buffer: List):
     return False
 
 
-def drag_rope_to_goal(robot_state_client, command_client, initial_transforms):
+def drag_rope_to_goal(robot_state_client, command_client, initial_transforms, angle=np.pi / 2):
     """
     Move the robot to a pose relative to the body while dragging the hose
     """
     force_buffer = []
 
     # Create the se2 trajectory for the dragging motion
-    walk_cmd_id = walk_to_pose_in_initial_frame(command_client, initial_transforms, x=2, y=-2.5, angle=np.pi / 2,
+    walk_cmd_id = walk_to_pose_in_initial_frame(command_client, initial_transforms, x=3, y=-2.3, angle=angle,
                                                 block=False)
 
     # loop to check forces
@@ -186,12 +188,17 @@ def walk_to_pose_in_initial_frame(command_client, initial_transforms, x=0., y=0.
 
 
 # noinspection DuplicatedCode
-def gaze_and_grasp(robot, robot_state_client, image_client, command_client, manipulation_api_client,
+def look_and_grasp(robot, robot_state_client, image_client, command_client, manipulation_api_client,
                    x=0.75, y=0, z=0.3,
-                   roll=0, pitch=np.deg2rad(20), yaw=0,
+                   roll=0, pitch=np.deg2rad(25), yaw=0,
                    duration=0.5):
     look_at_scene = look_at_command(robot_state_client, x, y, z, roll, pitch, yaw, duration)
     blocking_arm_command(command_client, look_at_scene)
+
+    pil_images = get_images(image_client)
+    now = int(time.time())
+    for i, pil_image in enumerate(pil_images):
+        pil_image.save(f"raw_images/look_{i}_{now}.png")
 
     # Take picture and get point
     robot.logger.info('Getting an image from: hand_color_image')
@@ -206,7 +213,7 @@ def gaze_and_grasp(robot, robot_state_client, image_client, command_client, mani
     walk_vec = get_pick_point_by_clicking(robot, image)
 
     # First just walk to in front of that point
-    offset_distance = wrappers_pb2.FloatValue(value=0.75)
+    offset_distance = wrappers_pb2.FloatValue(value=0.85)
     walk_to_cmd = manipulation_api_pb2.WalkToObjectInImage(pixel_xy=walk_vec,
                                                            transforms_snapshot_for_camera=image.shot.transforms_snapshot,
                                                            frame_name_image_sensor=image.shot.frame_name_image_sensor,
@@ -243,9 +250,9 @@ def do_grasp(robot, manipulation_api_client, image, pick_vec):
         pixel_xy=pick_vec, transforms_snapshot_for_camera=image.shot.transforms_snapshot,
         frame_name_image_sensor=image.shot.frame_name_image_sensor,
         camera_model=image.source.pinhole)
-    pick_cmd.grasp_params.grasp_params_frame_name = ODOM_FRAME_NAME
-    constraint = pick_cmd.grasp_params.allowable_orientation.add()
-    constraint.squeeze_grasp.SetInParent()
+    # pick_cmd.grasp_params.grasp_params_frame_name = ODOM_FRAME_NAME
+    # constraint = pick_cmd.grasp_params.allowable_orientation.add()
+    # constraint.squeeze_grasp.SetInParent()
     grasp_request = manipulation_api_pb2.ManipulationApiRequest(pick_object_in_image=pick_cmd)
     cmd_response = manipulation_api_client.manipulation_api_command(manipulation_api_request=grasp_request)
     # execute grasp
@@ -275,7 +282,7 @@ def get_pick_point_by_clicking(robot, image):
         dtype = np.uint16
     else:
         dtype = np.uint8
-    img = np.fromstring(image.shot.image.data, dtype=dtype)
+    img = np.frombuffer(image.shot.image.data, dtype=dtype)
     if image.shot.image.format == image_pb2.Image.FORMAT_RAW:
         img = img.reshape(image.shot.image.rows, image.shot.image.cols)
     else:
@@ -326,21 +333,30 @@ def arm_pull_rope(config):
 
     lease_client.take()
 
+    # Video recording
+    device_num = 4
+    cap = cv2.VideoCapture(device_num)
+    vr = VideoRecorder(cap, 'video/')
+    vr.start_new_recording(f'demo_{int(time.time())}.mp4')
+    vr.start_in_thread()
+
+    arm_pull_rope_with_lease(image_client, lease_client, manipulation_api_client, robot, robot_state_client)
+
+    vr.stop_in_thread()
+
+
+def arm_pull_rope_with_lease(image_client, lease_client, manipulation_api_client, robot, robot_state_client):
     with (bosdyn.client.lease.LeaseKeepAlive(lease_client, must_acquire=True, return_at_exit=True)):
         command_client = setup_and_stand(robot)
 
         initial_transforms = robot_state_client.get_robot_state().kinematic_state.transforms_snapshot
 
-        pil_images = get_images(image_client)
-        now = int(time.time())
-        for i, pil_image in enumerate(pil_images):
-            pil_image.save(f"initial_image{i}_{now}.png")
-
         # Grasp the hose to DRAG
-        gaze_and_grasp(robot, robot_state_client, image_client, command_client, manipulation_api_client)
+        look_and_grasp(robot, robot_state_client, image_client, command_client, manipulation_api_client)
 
         # TODO: detect goal pose
         goal_reached = drag_rope_to_goal(robot_state_client, command_client, initial_transforms)
+        time.sleep(1)  # makes the video look better in my opinion
         if goal_reached:
             robot.logger.info("Goal reached!")
             return
@@ -356,25 +372,16 @@ def arm_pull_rope(config):
         # Regrasp
         walk_to_pose_in_initial_frame(command_client, initial_transforms, x=0.0, y=0.0, angle=0.0)
 
-        pil_images = get_images(image_client)
-        now = int(time.time())
-        for i, pil_image in enumerate(pil_images):
-            pil_image.save(f"pre_stuck_image{i}_{now}.png")
-
         # Grasp the hose to get it UNSTUCK
-        gaze_and_grasp(robot, robot_state_client, image_client, command_client, manipulation_api_client)
+        look_and_grasp(robot, robot_state_client, image_client, command_client, manipulation_api_client)
 
         # Move the arm to get the hose unstuck
         blocking_arm_command(command_client, look_at_command(robot_state_client, 1.0, 0, 0.2))
         blocking_arm_command(command_client, look_at_command(robot_state_client, 1.0, -0.45, 0.2))
-        blocking_arm_command(command_client, look_at_command(robot_state_client, 1.0, -0.45, -0.2))
+        blocking_arm_command(command_client, look_at_command(robot_state_client, 1.0, -0.45, -0.4))
 
         # Open the gripper
-        t0 = time.time()
-        blocking_arm_command(command_client, RobotCommandBuilder.claw_gripper_open_command())
-        blocking_arm_command(command_client, RobotCommandBuilder.claw_gripper_close_command())
-        dt = time.time() - t0
-        robot.logger.info(f"dt = {dt}")
+        command_client.robot_command(RobotCommandBuilder.claw_gripper_open_command())
         time.sleep(1)  # FIXME: how to block on a gripper command?
 
         # Stow
@@ -383,18 +390,18 @@ def arm_pull_rope(config):
         # Look at the scene
         walk_to_pose_in_initial_frame(command_client, initial_transforms, x=0, y=0, angle=0)
 
-        pil_images = get_images(image_client)
-        now = int(time.time())
-        for i, pil_image in enumerate(pil_images):
-            pil_image.save(f"post_stuck_image{i}_{now}.png")
-
         # Grasp the hose to DRAG again
-        gaze_and_grasp(robot, robot_state_client, image_client, command_client, manipulation_api_client)
+        look_and_grasp(robot, robot_state_client, image_client, command_client, manipulation_api_client)
 
         # try again to drag the hose to the goal
         goal_reached = drag_rope_to_goal(robot_state_client, command_client, initial_transforms)
         robot.logger.info("Goal reached: %s", goal_reached)
 
+        # TODO: rotate around hand?
+        # This is sort of cheating, since we're not monitoring force
+        # walk_to_pose_in_initial_frame(command_client, initial_transforms, x=3, y=-1.9, angle=0, block=True)
+
+        input("Press enter to finish")
         return
 
 
@@ -411,6 +418,7 @@ def setup_and_stand(robot):
 
 
 def get_images(image_client):
+    time.sleep(0.5)  # to hopefully reduce motion blur
     image_sources = [
         'hand_color_image',
         'frontleft_fisheye_image',

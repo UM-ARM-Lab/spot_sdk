@@ -4,3 +4,6 @@
 *.swp
 *.pyc
 __pycache__
+video
+*.mp4
+*.avi
