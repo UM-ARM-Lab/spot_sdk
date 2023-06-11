@@ -120,7 +120,7 @@ def walk_to_object(config):
         walk_to = manipulation_api_pb2.WalkToObjectInImage(
             pixel_xy=walk_vec, transforms_snapshot_for_camera=image.shot.transforms_snapshot,
             frame_name_image_sensor=image.shot.frame_name_image_sensor,
-            camera_model=image.source.pinhole, offset_distance=offset_distance)
+            camera_model=image.source.pinhole, offset_distance=wrappers_pb2.FloatValue(value=0.7))
 
         # Ask the robot to pick up the object
         walk_to_request = manipulation_api_pb2.ManipulationApiRequest(

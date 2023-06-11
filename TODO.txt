@@ -1,0 +1,5 @@
+TODO:
+ - retrain model on the "end" of the hose, and on the "mess", and the white "battery"
+ - integrate perception
+ - make the grasp detection retry if it fails
+ - use ArmSurface command to generalie the "place" of the hose after getting it un-stuck

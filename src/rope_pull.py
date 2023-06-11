@@ -1,10 +1,8 @@
 import argparse
 import io
-
-from PIL import Image
 import sys
 import time
-from math import pi
+from typing import List
 
 import bosdyn.client
 import bosdyn.client.estop
@@ -13,6 +11,7 @@ import bosdyn.client.util
 import cv2
 import numpy as np
 import rerun as rr
+from PIL import Image
 from bosdyn import geometry
 from bosdyn.api import geometry_pb2, arm_command_pb2, synchronized_command_pb2, robot_command_pb2, \
     image_pb2, manipulation_api_pb2
@@ -25,9 +24,35 @@ from bosdyn.client.manipulation_api_client import ManipulationApiClient
 from bosdyn.client.robot_command import (RobotCommandBuilder, RobotCommandClient, blocking_stand,
                                          block_for_trajectory_cmd, block_until_arm_arrives)
 from bosdyn.client.robot_state import RobotStateClient
+from google.protobuf import wrappers_pb2
+
+FORCE_BUFFER_SIZE = 15
 
 g_image_click = None
 g_image_display = None
+
+
+def blocking_arm_command(command_client, cmd):
+    block_until_arm_arrives(command_client, command_client.robot_command(cmd))
+
+
+def block_for_manipulation_api_command(robot, manipulation_api_client, cmd_response):
+    while True:
+        time.sleep(0.25)
+        feedback_request = manipulation_api_pb2.ManipulationApiFeedbackRequest(
+            manipulation_cmd_id=cmd_response.manipulation_cmd_id)
+
+        # Send the request
+        response = manipulation_api_client.manipulation_api_feedback_command(
+            manipulation_api_feedback_request=feedback_request)
+
+        state_name = manipulation_api_pb2.ManipulationFeedbackState.Name(response.current_state)
+        robot.logger.info(f'Current state: {state_name}')
+
+        if response.current_state == manipulation_api_pb2.MANIP_STATE_DONE:
+            break
+
+    robot.logger.info('Finished.')
 
 
 def make_robot_command(arm_joint_traj):
@@ -42,7 +67,7 @@ def make_robot_command(arm_joint_traj):
     return RobotCommandBuilder.build_synchro_command(arm_sync_robot_cmd)
 
 
-def hand_gaze_ground_command(robot_state_client, x, y, z, roll=0, pitch=np.pi / 2, yaw=0, duration=0.5):
+def look_at_command(robot_state_client, x, y, z, roll=0, pitch=np.pi / 2, yaw=0, duration=0.5):
     """
     Move the arm to a pose relative to the body
 
@@ -92,22 +117,17 @@ def cv_mouse_callback(event, x, y, flags, param):
         cv2.imshow(image_title, clone)
 
 
-buffer = []
-
-
-def force_measure(state_client, command_client):
-    global buffer
-
+def force_measure(state_client, command_client, force_buffer: List):
     state = state_client.get_robot_state()
     manip_state = state.manipulator_state
     force_reading = manip_state.estimated_end_effector_force_in_hand
     total_force = np.sqrt(force_reading.x ** 2 + force_reading.y ** 2 + force_reading.z ** 2)
 
     # circular buffer
-    buffer.append(total_force)
-    if len(buffer) > 10:
-        buffer.pop(0)
-    recent_avg_total_force = float(np.mean(buffer))
+    force_buffer.append(total_force)
+    if len(force_buffer) > FORCE_BUFFER_SIZE:
+        force_buffer.pop(0)
+    recent_avg_total_force = float(np.mean(force_buffer))
 
     rr.log_scalar("force/x", force_reading.x)
     rr.log_scalar("force/y", force_reading.y)
@@ -115,21 +135,22 @@ def force_measure(state_client, command_client):
     rr.log_scalar("force/total", total_force)
     rr.log_scalar("force/recent_avg_total", recent_avg_total_force)
 
-    if recent_avg_total_force > 13:
+    if recent_avg_total_force > 14 and len(force_buffer) == FORCE_BUFFER_SIZE:
         print("large force detected!", force_reading.z)
-        stop_cmd = RobotCommandBuilder.stop_command()
-        stop_cmd_id = command_client.robot_command(stop_cmd)
+        command_client.robot_command(RobotCommandBuilder.stop_command())
         return True
     return False
 
 
-def drag_rope_to_pose(robot_state_client, command_client, se2pose, frame_name):
-    # walk backwards
-    robot_cmd = RobotCommandBuilder.synchro_se2_trajectory_command(goal_se2=se2pose.to_proto(), frame_name=frame_name,
-                                                                   locomotion_hint=spot_command_pb2.HINT_CRAWL)
-    walk_synchro_cmd = RobotCommandBuilder.build_synchro_command(robot_cmd)
-    walk_cmd_id = command_client.robot_command(lease=None, command=walk_synchro_cmd,
-                                               end_time_secs=time.time() + 999)
+def drag_rope_to_goal(robot_state_client, command_client, initial_transforms):
+    """
+    Move the robot to a pose relative to the body while dragging the hose
+    """
+    force_buffer = []
+
+    # Create the se2 trajectory for the dragging motion
+    walk_cmd_id = walk_to_pose_in_initial_frame(command_client, initial_transforms, x=2, y=-2.5, angle=np.pi / 2,
+                                                block=False)
 
     # loop to check forces
     while True:
@@ -143,17 +164,34 @@ def drag_rope_to_pose(robot_state_client, command_client, se2pose, frame_name):
                 traj_feedback.body_movement_status == traj_feedback.BODY_STATUS_SETTLED):
             print("Arrived at goal.")
             return True
-        if force_measure(robot_state_client, command_client):
+        if force_measure(robot_state_client, command_client, force_buffer):
             print("High force detected. Failed to reach goal.")
             return False
         time.sleep(0.25)
 
 
-def arm_pickup(robot, robot_state_client, image_client, command_client, manipulation_api_client, disp_x=0.75, disp_y=0.,
-               disp_z=0.2):
-    look_ground_command = hand_gaze_ground_command(robot_state_client, disp_x, disp_y, disp_z)
-    arm_cmd_id = command_client.robot_command(look_ground_command)
-    block_until_arm_arrives(command_client, arm_cmd_id)
+def walk_to_pose_in_initial_frame(command_client, initial_transforms, x=0., y=0., angle=0., block=True):
+    """
+    Non-blocking, returns the command id
+    """
+    goal_pose_in_odom = pose_in_start_frame(initial_transforms, x=x, y=y, angle=angle)
+    se2_cmd = RobotCommandBuilder.synchro_se2_trajectory_command(goal_se2=goal_pose_in_odom.to_proto(),
+                                                                 frame_name=ODOM_FRAME_NAME,
+                                                                 locomotion_hint=spot_command_pb2.HINT_CRAWL)
+    se2_synchro_commnd = RobotCommandBuilder.build_synchro_command(se2_cmd)
+    se2_cmd_id = command_client.robot_command(lease=None, command=se2_synchro_commnd, end_time_secs=time.time() + 999)
+    if block:
+        block_for_trajectory_cmd(command_client, se2_cmd_id)
+    return se2_cmd_id
+
+
+# noinspection DuplicatedCode
+def gaze_and_grasp(robot, robot_state_client, image_client, command_client, manipulation_api_client,
+                   x=0.75, y=0, z=0.3,
+                   roll=0, pitch=np.deg2rad(20), yaw=0,
+                   duration=0.5):
+    look_at_scene = look_at_command(robot_state_client, x, y, z, roll, pitch, yaw, duration)
+    blocking_arm_command(command_client, look_at_scene)
 
     # Take picture and get point
     robot.logger.info('Getting an image from: hand_color_image')
@@ -165,57 +203,51 @@ def arm_pickup(robot, robot_state_client, image_client, command_client, manipula
         assert False
 
     image = image_responses[0]
-    if image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_DEPTH_U16:
-        dtype = np.uint16
-    else:
-        dtype = np.uint8
-    img = np.fromstring(image.shot.image.data, dtype=dtype)
-    if image.shot.image.format == image_pb2.Image.FORMAT_RAW:
-        img = img.reshape(image.shot.image.rows, image.shot.image.cols)
-    else:
-        img = cv2.imdecode(img, -1)
+    walk_vec = get_pick_point_by_clicking(robot, image)
 
-    robot.logger.info('Click on an object to start grasping...')
-    image_title = 'Click to grasp'
-    cv2.namedWindow(image_title)
-    cv2.setMouseCallback(image_title, cv_mouse_callback)
+    # First just walk to in front of that point
+    offset_distance = wrappers_pb2.FloatValue(value=0.75)
+    walk_to_cmd = manipulation_api_pb2.WalkToObjectInImage(pixel_xy=walk_vec,
+                                                           transforms_snapshot_for_camera=image.shot.transforms_snapshot,
+                                                           frame_name_image_sensor=image.shot.frame_name_image_sensor,
+                                                           camera_model=image.source.pinhole,
+                                                           offset_distance=offset_distance)
+    walk_to_request = manipulation_api_pb2.ManipulationApiRequest(walk_to_object_in_image=walk_to_cmd)
+    walk_response = manipulation_api_client.manipulation_api_command(manipulation_api_request=walk_to_request)
+    block_for_manipulation_api_command(robot, manipulation_api_client, walk_response)
 
-    global g_image_click, g_image_display
-    g_image_display = img
-    cv2.imshow(image_title, g_image_display)
-    while g_image_click is None:
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q') or key == ord('Q'):
-            # Quit
-            print('"q" pressed, exiting.')
-            exit(0)
+    # look at the ground
+    look_at_ground = look_at_command(robot_state_client,
+                                     x=x, y=y, z=z,
+                                     roll=0, pitch=np.pi / 2, yaw=0,
+                                     duration=duration)
+    blocking_arm_command(command_client, look_at_ground)
 
-    robot.logger.info('Picking object at image location (' + str(g_image_click[0]) + ', ' +
-                      str(g_image_click[1]) + ')')
+    # Take picture and get point
+    robot.logger.info('Getting an image from: hand_color_image')
+    image_responses = image_client.get_image_from_sources(["hand_color_image"])
 
-    pick_vec = geometry_pb2.Vec2(x=g_image_click[0], y=g_image_click[1])
-    g_image_click = None
-    g_image_display = None
-    cv2.destroyAllWindows()
+    if len(image_responses) != 1:
+        print('Got invalid number of images: ' + str(len(image_responses)))
+        print(image_responses)
+        assert False
 
-    # build grasp
+    image = image_responses[0]
+    pick_vec = get_pick_point_by_clicking(robot, image)
 
-    grasp = manipulation_api_pb2.PickObjectInImage(
+    do_grasp(robot, manipulation_api_client, image, pick_vec)
+
+
+def do_grasp(robot, manipulation_api_client, image, pick_vec):
+    pick_cmd = manipulation_api_pb2.PickObjectInImage(
         pixel_xy=pick_vec, transforms_snapshot_for_camera=image.shot.transforms_snapshot,
         frame_name_image_sensor=image.shot.frame_name_image_sensor,
         camera_model=image.source.pinhole)
-
-    # Add squeeze grasp constraint
-
-    grasp.grasp_params.grasp_params_frame_name = ODOM_FRAME_NAME
-
-    constraint = grasp.grasp_params.allowable_orientation.add()
+    pick_cmd.grasp_params.grasp_params_frame_name = ODOM_FRAME_NAME
+    constraint = pick_cmd.grasp_params.allowable_orientation.add()
     constraint.squeeze_grasp.SetInParent()
-
-    grasp_request = manipulation_api_pb2.ManipulationApiRequest(pick_object_in_image=grasp)
-    cmd_response = manipulation_api_client.manipulation_api_command(
-        manipulation_api_request=grasp_request)
-
+    grasp_request = manipulation_api_pb2.ManipulationApiRequest(pick_object_in_image=pick_cmd)
+    cmd_response = manipulation_api_client.manipulation_api_command(manipulation_api_request=grasp_request)
     # execute grasp
     t0 = time.time()
     while time.time() - t0 < 10:
@@ -233,8 +265,44 @@ def arm_pickup(robot, robot_state_client, image_client, command_client, manipula
             break
 
         time.sleep(1)
-
     robot.logger.info('Finished grasp.')
+
+
+def get_pick_point_by_clicking(robot, image):
+    global g_image_click, g_image_display
+
+    if image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_DEPTH_U16:
+        dtype = np.uint16
+    else:
+        dtype = np.uint8
+    img = np.fromstring(image.shot.image.data, dtype=dtype)
+    if image.shot.image.format == image_pb2.Image.FORMAT_RAW:
+        img = img.reshape(image.shot.image.rows, image.shot.image.cols)
+    else:
+        img = cv2.imdecode(img, -1)
+    robot.logger.info('Click on an object to start grasping...')
+    image_title = 'Click to grasp'
+    cv2.namedWindow(image_title)
+    cv2.setMouseCallback(image_title, cv_mouse_callback)
+    g_image_display = img
+    cv2.imshow(image_title, g_image_display)
+    while g_image_click is None:
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q') or key == ord('Q'):
+            # Quit
+            print('"q" pressed, exiting.')
+            exit(0)
+    robot.logger.info('Picking object at image location (' + str(g_image_click[0]) + ', ' +
+                      str(g_image_click[1]) + ')')
+    pick_vec = geometry_pb2.Vec2(x=g_image_click[0], y=g_image_click[1])
+
+    cv2.destroyAllWindows()
+
+    # reset
+    g_image_click = None
+    g_image_display = None
+
+    return pick_vec
 
 
 def arm_pull_rope(config):
@@ -259,96 +327,87 @@ def arm_pull_rope(config):
     lease_client.take()
 
     with (bosdyn.client.lease.LeaseKeepAlive(lease_client, must_acquire=True, return_at_exit=True)):
-        # Robot startup
-
-        robot.logger.info("Powering on robot... This may take a several seconds.")
-        robot.power_on(timeout_sec=20)
-        assert robot.is_powered_on(), "Robot power on failed."
-        robot.logger.info("Robot powered on.")
-
-        robot.logger.info("Commanding robot to stand...")
-        command_client = robot.ensure_client(RobotCommandClient.default_service_name)
-        blocking_stand(command_client, timeout_sec=10)
-        robot.logger.info("Robot standing.")
+        command_client = setup_and_stand(robot)
 
         initial_transforms = robot_state_client.get_robot_state().kinematic_state.transforms_snapshot
-
-        # pose to back up and see everything
-        back_up_pose = pose_in_start_frame(initial_transforms, x=-1.5, y=0.4, angle=0)
-
-        # goal pose
-        goal_pose_in_odom = pose_in_start_frame(initial_transforms, x=0.75, y=-2.5, angle=pi / 2)
-
-        # Pickup hose
-        arm_pickup(robot=robot, image_client=image_client, manipulation_api_client=manipulation_api_client,
-                   robot_state_client=robot_state_client, command_client=command_client)
-
-        # start dragging hose toward the goal pose
-        if not drag_rope_to_pose(robot_state_client=robot_state_client, command_client=command_client,
-                                 se2pose=goal_pose_in_odom, frame_name=ODOM_FRAME_NAME):
-            open_gripper_cmd = RobotCommandBuilder.claw_gripper_open_command()
-            open_gripper_cmd_id = command_client.robot_command(open_gripper_cmd)
-            # TODO: block until gripper is open?
-            look_at_scene_cmd = hand_gaze_ground_command(robot_state_client, 0.7, 0, 0.2, roll=0, pitch=np.deg2rad(20),
-                                                         yaw=0)
-            look_at_scene_cmd_id = command_client.robot_command(look_at_scene_cmd)
-            block_until_arm_arrives(command_client, look_at_scene_cmd_id)
-            # FIXME: not sure why, but the arm status is "PROCESSING" after the above command
-            #  even when it appears to have reached the goal, so we also send a stop command
-            stop_cmd = RobotCommandBuilder.stop_command()
-            command_client.robot_command(stop_cmd)
-
-        # Regrasp
-
-        # walk back to view the whole scene
-        move_back_cmd = RobotCommandBuilder.synchro_se2_trajectory_command(goal_se2=back_up_pose.to_proto(),
-                                                                           frame_name=ODOM_FRAME_NAME)
-        move_back_cmd_id = command_client.robot_command(lease=None, command=move_back_cmd,
-                                                        end_time_secs=time.time() + 999)
-        block_body_trajectory_and_error(command_client, move_back_cmd_id)
 
         pil_images = get_images(image_client)
-
+        now = int(time.time())
         for i, pil_image in enumerate(pil_images):
-            pil_image.save(f"image{i}.png")
+            pil_image.save(f"initial_image{i}_{now}.png")
 
-        # pickup hose
-        arm_pickup(robot=robot, robot_state_client=robot_state_client, image_client=image_client,
-                   command_client=command_client, manipulation_api_client=manipulation_api_client, disp_x=0.75,
-                   disp_z=0.3)
+        # Grasp the hose to DRAG
+        gaze_and_grasp(robot, robot_state_client, image_client, command_client, manipulation_api_client)
 
-        # # walk backward a little bit then put the hose down
-        initial_transforms = robot_state_client.get_robot_state().kinematic_state.transforms_snapshot
-        put_down_hose_in_body = math_helpers.SE2Pose(x=0, y=-0.5, angle=0)
-        put_down_hose_in_odom = get_se2_a_tform_b(initial_transforms, ODOM_FRAME_NAME,
-                                                  GRAV_ALIGNED_BODY_FRAME_NAME) * put_down_hose_in_body
-        put_down_hose_cmd = RobotCommandBuilder.synchro_se2_trajectory_command(
-            goal_se2=put_down_hose_in_odom.to_proto(), frame_name=ODOM_FRAME_NAME,
-            locomotion_hint=spot_command_pb2.HINT_CRAWL)
+        # TODO: detect goal pose
+        goal_reached = drag_rope_to_goal(robot_state_client, command_client, initial_transforms)
+        if goal_reached:
+            robot.logger.info("Goal reached!")
+            return
 
-        lower_hand_cmd = hand_gaze_ground_command(robot_state_client, 0.75, 0.3, 0.2)
+        command_client.robot_command(RobotCommandBuilder.claw_gripper_open_command())
+        # FIXME: block until gripper is open?
+        blocking_arm_command(command_client, RobotCommandBuilder.arm_ready_command())
+        # FIXME: not sure why, but the arm status is "PROCESSING" after the above command
+        #  even when it appears to have reached the goal, so we also send a stop command
+        stop_cmd = RobotCommandBuilder.stop_command()
+        command_client.robot_command(stop_cmd)
 
-        unstick_hose_cmd = RobotCommandBuilder.build_synchro_command(put_down_hose_cmd, lower_hand_cmd)
-        unstick_hose_cmd_id = command_client.robot_command(lease=None, command=lower_hand_cmd,
-                                                           end_time_secs=time.time() + 4)
+        # Regrasp
+        walk_to_pose_in_initial_frame(command_client, initial_transforms, x=0.0, y=0.0, angle=0.0)
 
-        time.sleep(2)
-        open_gripper_cmd_stuck = RobotCommandBuilder.claw_gripper_open_command()
-        gripper_open_command_id_2 = command_client.robot_command(open_gripper_cmd_stuck)
-        time.sleep(2)
-        # redrag
+        pil_images = get_images(image_client)
+        now = int(time.time())
+        for i, pil_image in enumerate(pil_images):
+            pil_image.save(f"pre_stuck_image{i}_{now}.png")
 
-        arm_pickup(robot=robot, image_client=image_client, manipulation_api_client=manipulation_api_client,
-                   robot_state_client=robot_state_client, command_client=command_client, disp_y=-0.3)
-        time.sleep(4)
-        drag_rope_to_pose(robot_state_client=robot_state_client, command_client=command_client,
-                          se2pose=goal_pose_in_odom, frame_name=ODOM_FRAME_NAME)
-        time.sleep(15)
-        open_gripper_cmd_final = RobotCommandBuilder.claw_gripper_open_command()
-        gripper_open_command_id = command_client.robot_command(open_gripper_cmd_final)
+        # Grasp the hose to get it UNSTUCK
+        gaze_and_grasp(robot, robot_state_client, image_client, command_client, manipulation_api_client)
 
-        # move to start pose
-        move_to_start(command_client, initial_transforms)
+        # Move the arm to get the hose unstuck
+        blocking_arm_command(command_client, look_at_command(robot_state_client, 1.0, 0, 0.2))
+        blocking_arm_command(command_client, look_at_command(robot_state_client, 1.0, -0.45, 0.2))
+        blocking_arm_command(command_client, look_at_command(robot_state_client, 1.0, -0.45, -0.2))
+
+        # Open the gripper
+        t0 = time.time()
+        blocking_arm_command(command_client, RobotCommandBuilder.claw_gripper_open_command())
+        blocking_arm_command(command_client, RobotCommandBuilder.claw_gripper_close_command())
+        dt = time.time() - t0
+        robot.logger.info(f"dt = {dt}")
+        time.sleep(1)  # FIXME: how to block on a gripper command?
+
+        # Stow
+        blocking_arm_command(command_client, RobotCommandBuilder.arm_stow_command())
+
+        # Look at the scene
+        walk_to_pose_in_initial_frame(command_client, initial_transforms, x=0, y=0, angle=0)
+
+        pil_images = get_images(image_client)
+        now = int(time.time())
+        for i, pil_image in enumerate(pil_images):
+            pil_image.save(f"post_stuck_image{i}_{now}.png")
+
+        # Grasp the hose to DRAG again
+        gaze_and_grasp(robot, robot_state_client, image_client, command_client, manipulation_api_client)
+
+        # try again to drag the hose to the goal
+        goal_reached = drag_rope_to_goal(robot_state_client, command_client, initial_transforms)
+        robot.logger.info("Goal reached: %s", goal_reached)
+
+        return
+
+
+def setup_and_stand(robot):
+    robot.logger.info("Powering on robot... This may take a several seconds.")
+    robot.power_on(timeout_sec=20)
+    assert robot.is_powered_on(), "Robot power on failed."
+    robot.logger.info("Robot powered on.")
+    robot.logger.info("Commanding robot to stand...")
+    command_client = robot.ensure_client(RobotCommandClient.default_service_name)
+    blocking_stand(command_client, timeout_sec=10)
+    robot.logger.info("Robot standing.")
+    return command_client
 
 
 def get_images(image_client):
@@ -372,16 +431,6 @@ def get_images(image_client):
     return pil_images
 
 
-def move_to_start(command_client, initial_transforms):
-    start_pose_in_odom = pose_in_start_frame(initial_transforms, 0, 0, 0)
-    move_to_start_cmd = RobotCommandBuilder.synchro_se2_trajectory_command(
-        goal_se2=start_pose_in_odom.to_proto(), frame_name=ODOM_FRAME_NAME,
-        locomotion_hint=spot_command_pb2.HINT_CRAWL)
-    move_to_start_cmd_id = command_client.robot_command(lease=None, command=move_to_start_cmd,
-                                                        end_time_secs=time.time() + 999)
-    block_body_trajectory_and_error(command_client, move_to_start_cmd_id)
-
-
 def pose_in_start_frame(initial_transforms, x, y, angle):
     """
     The start frame is where the robot starts.
@@ -397,11 +446,6 @@ def pose_in_start_frame(initial_transforms, x, y, angle):
     return pose_in_odom
 
 
-def block_body_trajectory_and_error(command_client, cmd_id):
-    if not block_for_trajectory_cmd(command_client, cmd_id):
-        raise RuntimeError()
-
-
 def main(argv):
     pass
     parser = argparse.ArgumentParser()
@@ -409,13 +453,7 @@ def main(argv):
     options = parser.parse_args(argv)
     rr.init("rope_pull")
     rr.connect()
-    try:
-        arm_pull_rope(options)
-        return True
-    except Exception:
-        logger = bosdyn.client.util.get_logger()
-        logger.exception("Threw an exception")
-        return False
+    arm_pull_rope(options)
 
 
 if __name__ == '__main__':
