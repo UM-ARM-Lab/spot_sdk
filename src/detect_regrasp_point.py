@@ -23,7 +23,6 @@ class DetectionResult:
     grasp_px: np.ndarray
     candidates_pxs: np.ndarray
     predictions: List[Dict[str, np.ndarray]]
-    img: Image.Image
 
 
 def init_roboflow():
@@ -49,9 +48,9 @@ def get_or_load_predictions(model, test_image_filename):
     return predictions
 
 
-def viz_detection(detection):
+def viz_detection(pil_img, detection):
     plt.figure()
-    plt.imshow(detection.img)
+    plt.imshow(pil_img)
     rng = np.random.RandomState(0)
     class_colors = {}
     for pred in detection.predictions:
@@ -87,13 +86,12 @@ def get_polys(predictions, desired_class_name):
 
 
 def get_predictions(model, test_image_filename):
-    img = Image.open(test_image_filename)
     predictions = get_or_load_predictions(model, test_image_filename)
     predictions = predictions["predictions"]
-    return img, predictions
+    return predictions
 
 
-def detect_regrasp_point(img, predictions, near_px, far_px):
+def detect_regrasp_point(predictions, near_px, far_px):
     hose_class_name = "vacuum_hose"
     obstacle_class_name = "battery"
 
@@ -112,22 +110,27 @@ def detect_regrasp_point(img, predictions, near_px, far_px):
             # a point is a candidate if it is within some distance of an obstacle
             if near_px < min_d_to_any_obstacle < far_px:
                 candidates_pxs.append(hose_p)
+
+    if len(candidates_pxs) == 0:
+        raise DetectionError("No regrasp point candidates found")
+
     candidates_pxs = np.array(candidates_pxs)
     # compute the distance to the camera, approximated by the distance to the bottom-center of th image
     # for each candidate point.
-    d_to_center = np.linalg.norm(candidates_pxs - np.array([0, img.height / 2]), axis=-1)
+    # FIXME: hard coded jank
+    d_to_center = np.linalg.norm(candidates_pxs - np.array([0, 400]), axis=-1)
     grasp_px = candidates_pxs[np.argmin(d_to_center)]
 
-    return DetectionResult(grasp_px, candidates_pxs, predictions, img)
+    return DetectionResult(grasp_px, candidates_pxs, predictions)
 
 
-def detect_object_center(img, predictions, class_name):
+def detect_object_center(predictions, class_name):
     polygons = get_polys(predictions, class_name)
 
     if len(polygons) == 0:
-        raise DetectionError("No vacuum head detected")
+        raise DetectionError(f"No {class_name} detected")
     if len(polygons) > 1:
-        raise DetectionError("Multiple vacuum heads detected")
+        print("Warning: multiple objects detected")
 
     poly = polygons[0]
     M = cv2.moments(poly)
@@ -135,23 +138,24 @@ def detect_object_center(img, predictions, class_name):
     cy = int(M["m01"] / M["m00"])
     grasp_point = np.array([cx, cy])
 
-    return DetectionResult(grasp_point, [grasp_point], predictions, img)
+    return DetectionResult(grasp_point, np.array([grasp_point]), predictions)
 
 
 def main():
     model = init_roboflow()
 
     test_image_filename = "test1.png"
-    img, predictions = get_predictions(model, test_image_filename)
+    predictions = get_predictions(model, test_image_filename)
 
-    regrasp_detection = detect_regrasp_point(img, predictions, 10, 50)
-    viz_detection(regrasp_detection)
+    regrasp_detection = detect_regrasp_point(predictions, 10, 40)
+    pil_img = Image.open(test_image_filename)
+    viz_detection(pil_img, regrasp_detection)
 
-    head_detection = detect_object_center(img, predictions, "vacuum_head")
-    viz_detection(head_detection)
+    head_detection = detect_object_center(predictions, "vacuum_head")
+    viz_detection(pil_img, head_detection)
 
-    mess_detection = detect_object_center(img, predictions, "mess")
-    viz_detection(mess_detection)
+    mess_detection = detect_object_center(predictions, "mess")
+    viz_detection(pil_img, mess_detection)
 
 
 if __name__ == "__main__":

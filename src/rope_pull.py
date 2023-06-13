@@ -1,8 +1,10 @@
 import argparse
-import io
+import base64
+import json
+import os
 import sys
 import time
-from typing import List
+from typing import List, Callable
 
 import bosdyn.client
 import bosdyn.client.estop
@@ -10,32 +12,86 @@ import bosdyn.client.lease
 import bosdyn.client.util
 import cv2
 import numpy as np
+import requests
 import rerun as rr
-from PIL import Image
 from bosdyn import geometry
 from bosdyn.api import geometry_pb2, arm_command_pb2, synchronized_command_pb2, robot_command_pb2, \
     image_pb2, manipulation_api_pb2
 from bosdyn.api.basic_command_pb2 import RobotCommandFeedbackStatus
 from bosdyn.api.spot import robot_command_pb2 as spot_command_pb2
 from bosdyn.client import math_helpers
-from bosdyn.client.frame_helpers import ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME, get_a_tform_b, get_se2_a_tform_b
-from bosdyn.client.image import ImageClient, build_image_request
+from bosdyn.client.frame_helpers import ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME, get_a_tform_b, get_se2_a_tform_b, \
+    BODY_FRAME_NAME
+from bosdyn.client.image import ImageClient, build_image_request, pixel_to_camera_space
 from bosdyn.client.manipulation_api_client import ManipulationApiClient
 from bosdyn.client.robot_command import (RobotCommandBuilder, RobotCommandClient, blocking_stand,
                                          block_for_trajectory_cmd, block_until_arm_arrives)
 from bosdyn.client.robot_state import RobotStateClient
 from google.protobuf import wrappers_pb2
+from scipy import ndimage
 
-from src.video_recording import VideoRecorder, live_view
+from src.detect_regrasp_point import detect_object_center, viz_detection, DetectionError, get_polys, \
+    detect_regrasp_point
 
 FORCE_BUFFER_SIZE = 15
 
 g_image_click = None
 g_image_display = None
 
+ROTATION_ANGLE = {
+    'back_fisheye_image': 0,
+    'frontleft_fisheye_image': -78,
+    'frontleft_depth_in_visual_frame': -78,
+    'frontright_fisheye_image': -102,
+    'frontright_depth_in_visual_frame': -102,
+    'hand_depth_in_hand_color_frame': 0,
+    'hand_color_image': 0,
+    'left_fisheye_image': 0,
+    'right_fisheye_image': 180
+}
+
+
+def image_to_opencv(image, auto_rotate=True):
+    """Convert an image proto message to an openCV image."""
+    num_channels = 1  # Assume a default of 1 byte encodings.
+    if image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_DEPTH_U16:
+        dtype = np.uint16
+    else:
+        dtype = np.uint8
+        if image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_RGB_U8:
+            num_channels = 3
+        elif image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_RGBA_U8:
+            num_channels = 4
+        elif image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_GREYSCALE_U8:
+            num_channels = 1
+        elif image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_GREYSCALE_U16:
+            num_channels = 1
+            dtype = np.uint16
+
+    img = np.frombuffer(image.shot.image.data, dtype=dtype)
+    if image.shot.image.format == image_pb2.Image.FORMAT_RAW:
+        try:
+            # Attempt to reshape array into a RGB rows X cols shape.
+            img = img.reshape((image.shot.image.rows, image.shot.image.cols, num_channels))
+        except ValueError:
+            # Unable to reshape the image data, trying a regular decode.
+            img = cv2.imdecode(img, -1)
+    else:
+        img = cv2.imdecode(img, -1)
+
+    if image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_RGB_U8:
+        img = img[:, :, ::-1]
+
+    if auto_rotate:
+        img = ndimage.rotate(img, ROTATION_ANGLE[image.source.name])
+
+    return img
+
 
 def blocking_arm_command(command_client, cmd):
     block_until_arm_arrives(command_client, command_client.robot_command(cmd))
+    # FIXME: why is this needed???
+    command_client.robot_command(RobotCommandBuilder.stop_command())
 
 
 def block_for_manipulation_api_command(robot, manipulation_api_client, cmd_response):
@@ -138,20 +194,82 @@ def force_measure(state_client, command_client, force_buffer: List):
     rr.log_scalar("force/recent_avg_total", recent_avg_total_force)
 
     if recent_avg_total_force > 14 and len(force_buffer) == FORCE_BUFFER_SIZE:
-        print("large force detected!", force_reading.z)
+        print(f"large force detected! {recent_avg_total_force:.2f}")
         command_client.robot_command(RobotCommandBuilder.stop_command())
         return True
     return False
 
 
-def drag_rope_to_goal(robot_state_client, command_client, initial_transforms, angle=np.pi / 2):
+def setup_and_stand(robot):
+    robot.logger.info("Powering on robot... This may take a several seconds.")
+    robot.power_on(timeout_sec=20)
+    assert robot.is_powered_on(), "Robot power on failed."
+    robot.logger.info("Robot powered on.")
+    robot.logger.info("Commanding robot to stand...")
+    command_client = robot.ensure_client(RobotCommandClient.default_service_name)
+    blocking_stand(command_client, timeout_sec=10)
+    robot.logger.info("Robot standing.")
+    return command_client
+
+
+def np_to_vec2(a):
+    return geometry_pb2.Vec2(x=a[0], y=a[1])
+
+
+def pose_in_start_frame(initial_transforms, x, y, angle):
+    """
+    The start frame is where the robot starts.
+
+    Args:
+        initial_transforms: The initial transforms of the robot, this should be created at the beginning.
+        x: The x position of the pose in the start frame.
+        y: The y position of the pose in the start frame.
+        angle: The angle of the pose in the start frame.
+    """
+    pose_in_body = math_helpers.SE2Pose(x=x, y=y, angle=angle)
+    pose_in_odom = get_se2_a_tform_b(initial_transforms, ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME) * pose_in_body
+    return pose_in_odom
+
+
+def look_at_scene(command_client, robot_state_client, x=0.75, y=0.1, z=0.4, pitch=0, yaw=0, dx=0., dy=0., dpitch=0.):
+    look_cmd = look_at_command(robot_state_client, x + dx, y + dy, z,
+                               0, pitch + dpitch, yaw,
+                               duration=0.5)
+    blocking_arm_command(command_client, look_cmd)
+
+
+def get_color_img(image_client, src):
+    rgb_req = build_image_request(src, pixel_format=image_pb2.Image.PixelFormat.PIXEL_FORMAT_RGB_U8)
+    rgb_res = image_client.get_image([rgb_req])[0]
+    rgb_np = image_to_opencv(rgb_res, auto_rotate=True)
+    return rgb_np, rgb_res
+
+
+def get_depth_img(image_client, src):
+    depth_req = build_image_request(src, pixel_format=image_pb2.Image.PixelFormat.PIXEL_FORMAT_DEPTH_U16)
+    depth_res = image_client.get_image([depth_req])[0]
+    depth_np = image_to_opencv(depth_res, auto_rotate=True)
+    return depth_np, depth_res
+
+
+def get_predictions(rgb_np):
+    img_str = base64.b64encode(cv2.imencode('.jpg', rgb_np)[1])
+    upload_url = f"https://detect.roboflow.com/spot-vaccuming-demo/9?api_key={os.environ['ROBOFLOW_API_KEY']}"
+    resp = requests.post(upload_url, data=img_str, headers={
+        "Content-Type": "application/x-www-form-urlencoded"
+    }, stream=True).json()
+    predictions = resp['predictions']
+    return predictions
+
+
+def drag_rope_to_goal(robot_state_client, command_client, initial_transforms, x, y, angle):
     """
     Move the robot to a pose relative to the body while dragging the hose
     """
     force_buffer = []
 
     # Create the se2 trajectory for the dragging motion
-    walk_cmd_id = walk_to_pose_in_initial_frame(command_client, initial_transforms, x=3, y=-2.3, angle=angle,
+    walk_cmd_id = walk_to_pose_in_initial_frame(command_client, initial_transforms, x=x, y=y, angle=angle,
                                                 block=False)
 
     # loop to check forces
@@ -187,74 +305,104 @@ def walk_to_pose_in_initial_frame(command_client, initial_transforms, x=0., y=0.
     return se2_cmd_id
 
 
-# noinspection DuplicatedCode
-def look_and_grasp(robot, robot_state_client, image_client, command_client, manipulation_api_client,
-                   x=0.75, y=0, z=0.3,
-                   roll=0, pitch=np.deg2rad(25), yaw=0,
-                   duration=0.5):
-    look_at_scene = look_at_command(robot_state_client, x, y, z, roll, pitch, yaw, duration)
-    blocking_arm_command(command_client, look_at_scene)
+def rotate_image_coordinates(pts, width, height, rot):
+    """
+    Rotate image coordinates by rot degrees around the center of the image.
 
-    pil_images = get_images(image_client)
-    now = int(time.time())
-    for i, pil_image in enumerate(pil_images):
-        pil_image.save(f"raw_images/look_{i}_{now}.png")
+    Args:
+        pts: Nx2 array of image coordinates
+        width: width of image
+        height: height of image
+        rot: rotation in degrees
+    """
+    center = np.array([width / 2, height / 2])
+    rot = np.deg2rad(rot)
+    R = np.array([[np.cos(rot), -np.sin(rot)], [np.sin(rot), np.cos(rot)]])
+    new_pts = center + (pts - center) @ R.T
+    return new_pts
 
-    # Take picture and get point
-    robot.logger.info('Getting an image from: hand_color_image')
-    image_responses = image_client.get_image_from_sources(["hand_color_image"])
 
-    if len(image_responses) != 1:
-        print('Got invalid number of images: ' + str(len(image_responses)))
-        print(image_responses)
-        assert False
+def get_point_f_retry(command_client, robot_state_client, image_client, get_point_f: Callable,
+                      y, z, pitch=0):
+    dx = 0
+    dy = 0
+    dpitch = 0
+    while True:
+        look_at_scene(command_client, robot_state_client, z=z, pitch=pitch, dx=dx, dy=dy, dpitch=dpitch)
+        try:
+            rgb_res, vec = get_point_f(image_client)
+            return rgb_res, vec
+        except DetectionError:
+            dx = np.random.randn() * 0.03
+            dy = np.random.randn() * 0.03
+            dpitch = np.random.randn() * 0.05
 
-    image = image_responses[0]
-    walk_vec = get_pick_point_by_clicking(robot, image)
 
+def get_regrasp_point(image_client):
+    rgb_np, rgb_res = get_color_img(image_client, 'hand_color_image')
+    predictions = get_predictions(rgb_np)
+    import json
+    with open("pred.json", 'w') as f:
+        json.dump(predictions, f)
+    from PIL import Image
+    pil_img = Image.fromarray(rgb_np)
+    pil_img.save(f"test_{int(time.time())}.png")
+    import matplotlib.pyplot as plt
+    plt.imshow(rgb_np)
+    for pred in predictions:
+        xs = [p['x'] for p in pred['points']]
+        ys = [p['y'] for p in pred['points']]
+        plt.plot(xs, ys)
+    plt.show()
+    # pil_img.show()
+    regrasp_detection = detect_regrasp_point(predictions, 10, 40)
+    regrasp_vec = np_to_vec2(regrasp_detection.grasp_px)
+    return rgb_res, regrasp_vec
+
+
+def get_vacuum_head_point(image_client):
+    rgb_np, rgb_res = get_color_img(image_client, 'hand_color_image')
+    predictions = get_predictions(rgb_np)
+    detection = detect_object_center(predictions, "vacuum_head")
+    viz_detection(rgb_np, detection)
+    vacuum_head_vec = np_to_vec2(detection.grasp_px)
+    return rgb_res, vacuum_head_vec
+
+
+def walk_to_then_grasp(robot, robot_state_client, image_client, command_client, manipulation_api_client,
+                       get_point_f: Callable):
+    rgb_res, walk_vec = get_point_f_retry(command_client, robot_state_client, image_client, get_point_f,
+                                          y=0.1,
+                                          z=0.4,
+                                          pitch=np.deg2rad(25))
+
+    # NOTE: if we are going to use the body cameras, which are rotated, we also need to rotate the image coordinates
     # First just walk to in front of that point
-    offset_distance = wrappers_pb2.FloatValue(value=0.85)
+    offset_distance = wrappers_pb2.FloatValue(value=1.00)
     walk_to_cmd = manipulation_api_pb2.WalkToObjectInImage(pixel_xy=walk_vec,
-                                                           transforms_snapshot_for_camera=image.shot.transforms_snapshot,
-                                                           frame_name_image_sensor=image.shot.frame_name_image_sensor,
-                                                           camera_model=image.source.pinhole,
+                                                           transforms_snapshot_for_camera=rgb_res.shot.transforms_snapshot,
+                                                           frame_name_image_sensor=rgb_res.shot.frame_name_image_sensor,
+                                                           camera_model=rgb_res.source.pinhole,
                                                            offset_distance=offset_distance)
     walk_to_request = manipulation_api_pb2.ManipulationApiRequest(walk_to_object_in_image=walk_to_cmd)
     walk_response = manipulation_api_client.manipulation_api_command(manipulation_api_request=walk_to_request)
     block_for_manipulation_api_command(robot, manipulation_api_client, walk_response)
 
-    # look at the ground
-    look_at_ground = look_at_command(robot_state_client,
-                                     x=x, y=y, z=z,
-                                     roll=0, pitch=np.pi / 2, yaw=0,
-                                     duration=duration)
-    blocking_arm_command(command_client, look_at_ground)
-
-    # Take picture and get point
-    robot.logger.info('Getting an image from: hand_color_image')
-    image_responses = image_client.get_image_from_sources(["hand_color_image"])
-
-    if len(image_responses) != 1:
-        print('Got invalid number of images: ' + str(len(image_responses)))
-        print(image_responses)
-        assert False
-
-    image = image_responses[0]
-    pick_vec = get_pick_point_by_clicking(robot, image)
-
-    do_grasp(robot, manipulation_api_client, image, pick_vec)
+    rgb_res, pick_vec = get_point_f_retry(command_client, robot_state_client, image_client, get_point_f,
+                                          z=0.5,
+                                          y=0.1,
+                                          pitch=np.pi / 2)
+    do_grasp(robot, manipulation_api_client, rgb_res, pick_vec)
 
 
-def do_grasp(robot, manipulation_api_client, image, pick_vec):
+def do_grasp(robot, manipulation_api_client, image_res, pick_vec):
     pick_cmd = manipulation_api_pb2.PickObjectInImage(
-        pixel_xy=pick_vec, transforms_snapshot_for_camera=image.shot.transforms_snapshot,
-        frame_name_image_sensor=image.shot.frame_name_image_sensor,
-        camera_model=image.source.pinhole)
-    # pick_cmd.grasp_params.grasp_params_frame_name = ODOM_FRAME_NAME
-    # constraint = pick_cmd.grasp_params.allowable_orientation.add()
-    # constraint.squeeze_grasp.SetInParent()
+        pixel_xy=pick_vec, transforms_snapshot_for_camera=image_res.shot.transforms_snapshot,
+        frame_name_image_sensor=image_res.shot.frame_name_image_sensor,
+        camera_model=image_res.source.pinhole)
     grasp_request = manipulation_api_pb2.ManipulationApiRequest(pick_object_in_image=pick_cmd)
     cmd_response = manipulation_api_client.manipulation_api_command(manipulation_api_request=grasp_request)
+
     # execute grasp
     t0 = time.time()
     while time.time() - t0 < 10:
@@ -275,23 +423,13 @@ def do_grasp(robot, manipulation_api_client, image, pick_vec):
     robot.logger.info('Finished grasp.')
 
 
-def get_pick_point_by_clicking(robot, image):
+def get_pick_point_by_clicking(rgb_np):
     global g_image_click, g_image_display
 
-    if image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_DEPTH_U16:
-        dtype = np.uint16
-    else:
-        dtype = np.uint8
-    img = np.frombuffer(image.shot.image.data, dtype=dtype)
-    if image.shot.image.format == image_pb2.Image.FORMAT_RAW:
-        img = img.reshape(image.shot.image.rows, image.shot.image.cols)
-    else:
-        img = cv2.imdecode(img, -1)
-    robot.logger.info('Click on an object to start grasping...')
     image_title = 'Click to grasp'
     cv2.namedWindow(image_title)
     cv2.setMouseCallback(image_title, cv_mouse_callback)
-    g_image_display = img
+    g_image_display = rgb_np.copy()
     cv2.imshow(image_title, g_image_display)
     while g_image_click is None:
         key = cv2.waitKey(1) & 0xFF
@@ -299,17 +437,10 @@ def get_pick_point_by_clicking(robot, image):
             # Quit
             print('"q" pressed, exiting.')
             exit(0)
-    robot.logger.info('Picking object at image location (' + str(g_image_click[0]) + ', ' +
-                      str(g_image_click[1]) + ')')
-    pick_vec = geometry_pb2.Vec2(x=g_image_click[0], y=g_image_click[1])
 
     cv2.destroyAllWindows()
 
-    # reset
-    g_image_click = None
-    g_image_display = None
-
-    return pick_vec
+    return g_image_click
 
 
 def arm_pull_rope(config):
@@ -334,28 +465,77 @@ def arm_pull_rope(config):
     lease_client.take()
 
     # Video recording
-    device_num = 4
-    cap = cv2.VideoCapture(device_num)
-    vr = VideoRecorder(cap, 'video/')
-    vr.start_new_recording(f'demo_{int(time.time())}.mp4')
-    vr.start_in_thread()
+    # device_num = 4
+    # cap = cv2.VideoCapture(device_num)
+    # vr = VideoRecorder(cap, 'video/')
+    # vr.start_new_recording(f'demo_{int(time.time())}.mp4')
+    # vr.start_in_thread()
 
-    arm_pull_rope_with_lease(image_client, lease_client, manipulation_api_client, robot, robot_state_client)
+    arm_pull_rope_with_lease(lease_client, image_client, manipulation_api_client, robot, robot_state_client)
 
-    vr.stop_in_thread()
+    # vr.stop_in_thread()
 
 
-def arm_pull_rope_with_lease(image_client, lease_client, manipulation_api_client, robot, robot_state_client):
+def arm_pull_rope_with_lease(lease_client, image_client, manipulation_api_client, robot, robot_state_client):
     with (bosdyn.client.lease.LeaseKeepAlive(lease_client, must_acquire=True, return_at_exit=True)):
         command_client = setup_and_stand(robot)
 
         initial_transforms = robot_state_client.get_robot_state().kinematic_state.transforms_snapshot
 
-        # Grasp the hose to DRAG
-        look_and_grasp(robot, robot_state_client, image_client, command_client, manipulation_api_client)
+        # first detect the goal
+        # move the hand to a pose where we can hopefully see the goal better
+        quat = geometry.EulerZXY(roll=0, pitch=0.3, yaw=-0.7).to_quaternion()
+        arm_pose_cmd = RobotCommandBuilder.arm_pose_command(0.65, -0.1, 0.5, quat.w, quat.x, quat.y, quat.z,
+                                                            BODY_FRAME_NAME, 1)
+        blocking_arm_command(command_client, arm_pose_cmd)
 
-        # TODO: detect goal pose
-        goal_reached = drag_rope_to_goal(robot_state_client, command_client, initial_transforms)
+        rgb_np, rgb_res = get_color_img(image_client, 'hand_color_image')
+        depth_np, depth_res = get_depth_img(image_client, 'hand_depth_in_hand_color_frame')
+
+        predictions = get_predictions(rgb_np)
+
+        mess_polys = get_polys(predictions, "mess")
+        if len(mess_polys) != 1:
+            robot.logger.warning(f"Error: expected 1 mess, got {len(mess_polys)}")
+
+        # Image.fromarray(rgb_np).save(f"mess_{int(time.time())}.png")
+        import matplotlib.pyplot as plt
+        plt.imshow(rgb_np, alpha=0.5)
+        plt.imshow(depth_np, alpha=0.5)
+        for mess_poly in mess_polys:
+            plt.plot(mess_poly[:, 0], mess_poly[:, 1], 'r-')
+        plt.show()
+
+        # TODO: rotate if needed?
+        mess_mask = np.zeros(depth_np.shape[:2])
+        cv2.drawContours(mess_mask, mess_polys, -1, (1), 1)
+        # expand the mask a bit
+        mess_mask = cv2.dilate(mess_mask, np.ones((5, 5), np.uint8), iterations=1)
+        depths_m = depth_np[np.where(mess_mask == 1)] / 1000
+        nonzero_depths_m = depths_m[np.where(np.logical_and(depths_m > 0, np.isfinite(depths_m)))]
+        depth_m = nonzero_depths_m.mean()
+        if not np.isfinite(depth_m):
+            breakpoint()
+        M = cv2.moments(mess_polys[0])
+        mess_px = int(M["m10"] / M["m00"])
+        mess_py = int(M["m01"] / M["m00"])
+
+        mess_pos_in_cam = np.array(pixel_to_camera_space(rgb_res, mess_px, mess_py, depth=depth_m))  # [x, y, z]
+
+        mess_in_cam = math_helpers.SE3Pose(*mess_pos_in_cam, math_helpers.Quat())
+        # FIXME: why can't we use "GRAV_ALIGNED_BODY_FRAME_NAME" here?
+        cam2body = get_a_tform_b(rgb_res.shot.transforms_snapshot, BODY_FRAME_NAME,
+                                 rgb_res.shot.frame_name_image_sensor)
+        mess_in_body = cam2body * mess_in_cam
+        mess_x = mess_in_body.x
+        mess_y = mess_in_body.y
+
+        # Grasp the hose to DRAG
+        walk_to_then_grasp(robot, robot_state_client, image_client, command_client, manipulation_api_client,
+                           get_vacuum_head_point)
+
+        goal_reached = drag_rope_to_goal(robot_state_client, command_client, initial_transforms, mess_x, mess_y,
+                                         np.pi / 2)
         time.sleep(1)  # makes the video look better in my opinion
         if goal_reached:
             robot.logger.info("Goal reached!")
@@ -364,16 +544,13 @@ def arm_pull_rope_with_lease(image_client, lease_client, manipulation_api_client
         command_client.robot_command(RobotCommandBuilder.claw_gripper_open_command())
         # FIXME: block until gripper is open?
         blocking_arm_command(command_client, RobotCommandBuilder.arm_ready_command())
-        # FIXME: not sure why, but the arm status is "PROCESSING" after the above command
-        #  even when it appears to have reached the goal, so we also send a stop command
-        stop_cmd = RobotCommandBuilder.stop_command()
-        command_client.robot_command(stop_cmd)
 
         # Regrasp
         walk_to_pose_in_initial_frame(command_client, initial_transforms, x=0.0, y=0.0, angle=0.0)
 
         # Grasp the hose to get it UNSTUCK
-        look_and_grasp(robot, robot_state_client, image_client, command_client, manipulation_api_client)
+        walk_to_then_grasp(robot, robot_state_client, image_client, command_client, manipulation_api_client,
+                           get_regrasp_point)
 
         # Move the arm to get the hose unstuck
         blocking_arm_command(command_client, look_at_command(robot_state_client, 1.0, 0, 0.2))
@@ -391,10 +568,12 @@ def arm_pull_rope_with_lease(image_client, lease_client, manipulation_api_client
         walk_to_pose_in_initial_frame(command_client, initial_transforms, x=0, y=0, angle=0)
 
         # Grasp the hose to DRAG again
-        look_and_grasp(robot, robot_state_client, image_client, command_client, manipulation_api_client)
+        walk_to_then_grasp(robot, robot_state_client, image_client, command_client, manipulation_api_client,
+                           get_vacuum_head_point)
 
         # try again to drag the hose to the goal
-        goal_reached = drag_rope_to_goal(robot_state_client, command_client, initial_transforms)
+        goal_reached = drag_rope_to_goal(robot_state_client, command_client, initial_transforms, mess_x, mess_y,
+                                         np.pi / 2)
         robot.logger.info("Goal reached: %s", goal_reached)
 
         # TODO: rotate around hand?
@@ -403,55 +582,6 @@ def arm_pull_rope_with_lease(image_client, lease_client, manipulation_api_client
 
         input("Press enter to finish")
         return
-
-
-def setup_and_stand(robot):
-    robot.logger.info("Powering on robot... This may take a several seconds.")
-    robot.power_on(timeout_sec=20)
-    assert robot.is_powered_on(), "Robot power on failed."
-    robot.logger.info("Robot powered on.")
-    robot.logger.info("Commanding robot to stand...")
-    command_client = robot.ensure_client(RobotCommandClient.default_service_name)
-    blocking_stand(command_client, timeout_sec=10)
-    robot.logger.info("Robot standing.")
-    return command_client
-
-
-def get_images(image_client):
-    time.sleep(0.5)  # to hopefully reduce motion blur
-    image_sources = [
-        'hand_color_image',
-        'frontleft_fisheye_image',
-        'frontright_fisheye_image',
-    ]
-    rotations = [
-        0,
-        -90,
-        -90,
-    ]
-    image_requests = [
-        build_image_request(src, pixel_format=image_pb2.Image.PixelFormat.PIXEL_FORMAT_RGB_U8)
-        for src in image_sources
-    ]
-    image_responses = image_client.get_image(image_requests)
-    pil_images = [Image.open(io.BytesIO(res.shot.image.data)).convert('RGB').rotate(rot) for res, rot in
-                  zip(image_responses, rotations)]
-    return pil_images
-
-
-def pose_in_start_frame(initial_transforms, x, y, angle):
-    """
-    The start frame is where the robot starts.
-
-    Args:
-        initial_transforms: The initial transforms of the robot, this should be created at the beginning.
-        x: The x position of the pose in the start frame.
-        y: The y position of the pose in the start frame.
-        angle: The angle of the pose in the start frame.
-    """
-    pose_in_body = math_helpers.SE2Pose(x=x, y=y, angle=angle)
-    pose_in_odom = get_se2_a_tform_b(initial_transforms, ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME) * pose_in_body
-    return pose_in_odom
 
 
 def main(argv):

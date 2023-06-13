@@ -34,40 +34,6 @@ ROTATION_ANGLE = {
 }
 
 
-def image_to_opencv(image, auto_rotate=True):
-    """Convert an image proto message to an openCV image."""
-    num_channels = 1  # Assume a default of 1 byte encodings.
-    if image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_DEPTH_U16:
-        dtype = np.uint16
-        extension = ".png"
-    else:
-        dtype = np.uint8
-        if image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_RGB_U8:
-            num_channels = 3
-        elif image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_RGBA_U8:
-            num_channels = 4
-        elif image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_GREYSCALE_U8:
-            num_channels = 1
-        elif image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_GREYSCALE_U16:
-            num_channels = 1
-            dtype = np.uint16
-        extension = ".jpg"
-
-    img = np.frombuffer(image.shot.image.data, dtype=dtype)
-    if image.shot.image.format == image_pb2.Image.FORMAT_RAW:
-        try:
-            # Attempt to reshape array into a RGB rows X cols shape.
-            img = img.reshape((image.shot.image.rows, image.shot.image.cols, num_channels))
-        except ValueError:
-            # Unable to reshape the image data, trying a regular decode.
-            img = cv2.imdecode(img, -1)
-    else:
-        img = cv2.imdecode(img, -1)
-
-    if auto_rotate:
-        img = ndimage.rotate(img, ROTATION_ANGLE[image.source.name])
-
-    return img, extension
 
 
 def reset_image_client(robot):

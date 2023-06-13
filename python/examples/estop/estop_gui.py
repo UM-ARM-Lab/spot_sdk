@@ -15,6 +15,7 @@ import sys
 import threading
 import traceback
 from datetime import datetime
+from time import sleep
 
 import grpc
 from six.moves import queue
@@ -264,14 +265,19 @@ def main(argv):
     bosdyn.client.util.setup_logging(options.verbose)
 
     # Create robot object
-    sdk = bosdyn.client.create_standard_sdk('estop_gui')
-    robot = sdk.create_robot(options.hostname)
-    bosdyn.client.util.authenticate(robot)
+    while True:
+        try:
+            sdk = bosdyn.client.create_standard_sdk('estop_gui')
+            robot = sdk.create_robot(options.hostname)
+            bosdyn.client.util.authenticate(robot)
 
-    # Create estop client for the robot
-    estop_client = robot.ensure_client(EstopClient.default_service_name)
+            # Create estop client for the robot
+            estop_client = robot.ensure_client(EstopClient.default_service_name)
 
-    exit(build_and_run_app(options.hostname, estop_client, options))
+            exit(build_and_run_app(options.hostname, estop_client, options))
+        except Exception:
+            print("Failed to connect to robot. Retrying in 10 seconds.")
+            sleep(10)
 
 
 if __name__ == '__main__':
