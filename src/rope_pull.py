@@ -31,7 +31,7 @@ from google.protobuf import wrappers_pb2
 from scipy import ndimage
 
 from src.detect_regrasp_point import detect_object_center, viz_detection, DetectionError, get_polys, \
-    detect_regrasp_point
+    detect_regrasp_point, MODEL_VERSION
 
 FORCE_BUFFER_SIZE = 15
 
@@ -45,6 +45,7 @@ ROTATION_ANGLE = {
     'frontright_fisheye_image': -102,
     'frontright_depth_in_visual_frame': -102,
     'hand_depth_in_hand_color_frame': 0,
+    'hand_depth': 0,
     'hand_color_image': 0,
     'left_fisheye_image': 0,
     'right_fisheye_image': 180
@@ -253,12 +254,20 @@ def get_depth_img(image_client, src):
 
 
 def get_predictions(rgb_np):
-    img_str = base64.b64encode(cv2.imencode('.jpg', rgb_np)[1])
-    upload_url = f"https://detect.roboflow.com/spot-vaccuming-demo/9?api_key={os.environ['ROBOFLOW_API_KEY']}"
-    resp = requests.post(upload_url, data=img_str, headers={
-        "Content-Type": "application/x-www-form-urlencoded"
-    }, stream=True).json()
-    predictions = resp['predictions']
+    def _get_predictions(_rgb_np):
+        img_str = base64.b64encode(cv2.imencode('.jpg', _rgb_np)[1])
+        upload_url = f"https://detect.roboflow.com/spot-vaccuming-demo/{MODEL_VERSION}?api_key={os.environ['ROBOFLOW_API_KEY']}"
+        resp = requests.post(upload_url, data=img_str, headers={
+            "Content-Type": "application/x-www-form-urlencoded"
+        }, stream=True).json()
+        _predictions = resp['predictions']
+        return _predictions
+
+    # FIXME: not sure why switching RGB<-->BGR seemed to fix it one time when I tried it
+    predictions = _get_predictions(rgb_np)
+    if len(predictions) == 0:
+        predictions = get_predictions(rgb_np[:, :, ::-1])
+
     return predictions
 
 
@@ -323,41 +332,102 @@ def rotate_image_coordinates(pts, width, height, rot):
 
 
 def get_point_f_retry(command_client, robot_state_client, image_client, get_point_f: Callable,
-                      y, z, pitch=0):
+                      y, z, pitch=0., yaw=0.):
     dx = 0
     dy = 0
     dpitch = 0
     while True:
-        look_at_scene(command_client, robot_state_client, z=z, pitch=pitch, dx=dx, dy=dy, dpitch=dpitch)
+        look_at_scene(command_client, robot_state_client, y=y, z=z, pitch=pitch, yaw=yaw, dx=dx, dy=dy, dpitch=dpitch)
         try:
-            rgb_res, vec = get_point_f(image_client)
-            return rgb_res, vec
+            return get_point_f(image_client)
         except DetectionError:
-            dx = np.random.randn() * 0.03
-            dy = np.random.randn() * 0.03
-            dpitch = np.random.randn() * 0.05
+            dx = np.random.randn() * 0.04
+            dy = np.random.randn() * 0.04
+            dpitch = np.random.randn() * 0.08
 
 
 def get_regrasp_point(image_client):
     rgb_np, rgb_res = get_color_img(image_client, 'hand_color_image')
     predictions = get_predictions(rgb_np)
+
+    now = int(time.time())
     import json
-    with open("pred.json", 'w') as f:
+    with open(f"pred_{now}.json", 'w') as f:
         json.dump(predictions, f)
     from PIL import Image
     pil_img = Image.fromarray(rgb_np)
-    pil_img.save(f"test_{int(time.time())}.png")
+    pil_img.save(f"img_{now}.png")
     import matplotlib.pyplot as plt
-    plt.imshow(rgb_np)
+
+    fig, ax = plt.subplots()
+    ax.imshow(rgb_np)
     for pred in predictions:
         xs = [p['x'] for p in pred['points']]
         ys = [p['y'] for p in pred['points']]
-        plt.plot(xs, ys)
-    plt.show()
-    # pil_img.show()
-    regrasp_detection = detect_regrasp_point(predictions, 10, 40)
+        ax.plot(xs, ys)
+    fig.show()
+
+    regrasp_detection = detect_regrasp_point(predictions, 80)
     regrasp_vec = np_to_vec2(regrasp_detection.grasp_px)
+
+    ax.scatter(regrasp_vec.x, regrasp_vec.y, s=100, marker='*', c='r', zorder=3)
+    fig.show()
+
     return rgb_res, regrasp_vec
+
+
+def get_mess(image_client):
+    rgb_np, rgb_res = get_color_img(image_client, 'hand_color_image')
+    depth_np, depth_res = get_depth_img(image_client, 'hand_depth_in_hand_color_frame')
+
+    predictions = get_predictions(rgb_np)
+
+    mess_polys = get_polys(predictions, "mess")
+
+    if len(mess_polys) == 0:
+        raise DetectionError("No mess detected")
+
+    if len(mess_polys) != 1:
+        print(f"Error: expected 1 mess, got {len(mess_polys)}")
+
+    from PIL import Image
+    import matplotlib.pyplot as plt
+    Image.fromarray(rgb_np).save(f"mess_{int(time.time())}.png")
+    fig, ax = plt.subplots()
+    ax.imshow(rgb_np, alpha=0.5, zorder=0)
+    ax.imshow(depth_np, alpha=0.5, zorder=1)
+    for mess_poly in mess_polys:
+        ax.plot(mess_poly[:, 0], mess_poly[:, 1], zorder=2, linewidth=3)
+    fig.show()
+
+    # NOTE: we would need to handle the rotate if we used the body cameras
+    mess_mask = np.zeros(depth_np.shape[:2])
+    cv2.drawContours(mess_mask, mess_polys, -1, (1), 1)
+    # expand the mask a bit
+    mess_mask = cv2.dilate(mess_mask, np.ones((5, 5), np.uint8), iterations=1)
+    depths_m = depth_np[np.where(mess_mask == 1)] / 1000
+    nonzero_depths_m = depths_m[np.where(np.logical_and(depths_m > 0, np.isfinite(depths_m)))]
+    depth_m = nonzero_depths_m.mean()
+
+    if not np.isfinite(depth_m):
+        raise DetectionError("depth is NaN")
+
+    M = cv2.moments(mess_polys[0])
+    mess_px = int(M["m10"] / M["m00"])
+    mess_py = int(M["m01"] / M["m00"])
+
+    mess_pos_in_cam = np.array(pixel_to_camera_space(rgb_res, mess_px, mess_py, depth=depth_m))  # [x, y, z]
+
+    mess_in_cam = math_helpers.SE3Pose(*mess_pos_in_cam, math_helpers.Quat())
+    # FIXME: why can't we use "GRAV_ALIGNED_BODY_FRAME_NAME" here?
+    cam2body = get_a_tform_b(rgb_res.shot.transforms_snapshot, BODY_FRAME_NAME,
+                             rgb_res.shot.frame_name_image_sensor)
+    mess_in_body = cam2body * mess_in_cam
+    mess_x = mess_in_body.x
+    mess_y = mess_in_body.y
+
+    print(f"Mess detected at {mess_x:.2f}, {mess_y:.2f}")
+    return mess_x, mess_y
 
 
 def get_vacuum_head_point(image_client):
@@ -365,6 +435,8 @@ def get_vacuum_head_point(image_client):
     predictions = get_predictions(rgb_np)
     detection = detect_object_center(predictions, "vacuum_head")
     viz_detection(rgb_np, detection)
+    from PIL import Image
+    Image.fromarray(rgb_np).save("head.png")
     vacuum_head_vec = np_to_vec2(detection.grasp_px)
     return rgb_res, vacuum_head_vec
 
@@ -389,9 +461,9 @@ def walk_to_then_grasp(robot, robot_state_client, image_client, command_client, 
     block_for_manipulation_api_command(robot, manipulation_api_client, walk_response)
 
     rgb_res, pick_vec = get_point_f_retry(command_client, robot_state_client, image_client, get_point_f,
-                                          z=0.5,
+                                          z=0.45,
                                           y=0.1,
-                                          pitch=np.pi / 2)
+                                          pitch=1.25)
     do_grasp(robot, manipulation_api_client, rgb_res, pick_vec)
 
 
@@ -421,26 +493,6 @@ def do_grasp(robot, manipulation_api_client, image_res, pick_vec):
 
         time.sleep(1)
     robot.logger.info('Finished grasp.')
-
-
-def get_pick_point_by_clicking(rgb_np):
-    global g_image_click, g_image_display
-
-    image_title = 'Click to grasp'
-    cv2.namedWindow(image_title)
-    cv2.setMouseCallback(image_title, cv_mouse_callback)
-    g_image_display = rgb_np.copy()
-    cv2.imshow(image_title, g_image_display)
-    while g_image_click is None:
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q') or key == ord('Q'):
-            # Quit
-            print('"q" pressed, exiting.')
-            exit(0)
-
-    cv2.destroyAllWindows()
-
-    return g_image_click
 
 
 def arm_pull_rope(config):
@@ -482,53 +534,13 @@ def arm_pull_rope_with_lease(lease_client, image_client, manipulation_api_client
 
         initial_transforms = robot_state_client.get_robot_state().kinematic_state.transforms_snapshot
 
+        # open the hand, so we can see more with the depth sensor
+        command_client.robot_command(RobotCommandBuilder.claw_gripper_open_command())
+
         # first detect the goal
-        # move the hand to a pose where we can hopefully see the goal better
-        quat = geometry.EulerZXY(roll=0, pitch=0.3, yaw=-0.7).to_quaternion()
-        arm_pose_cmd = RobotCommandBuilder.arm_pose_command(0.65, -0.1, 0.5, quat.w, quat.x, quat.y, quat.z,
-                                                            BODY_FRAME_NAME, 1)
-        blocking_arm_command(command_client, arm_pose_cmd)
-
-        rgb_np, rgb_res = get_color_img(image_client, 'hand_color_image')
-        depth_np, depth_res = get_depth_img(image_client, 'hand_depth_in_hand_color_frame')
-
-        predictions = get_predictions(rgb_np)
-
-        mess_polys = get_polys(predictions, "mess")
-        if len(mess_polys) != 1:
-            robot.logger.warning(f"Error: expected 1 mess, got {len(mess_polys)}")
-
-        # Image.fromarray(rgb_np).save(f"mess_{int(time.time())}.png")
-        import matplotlib.pyplot as plt
-        plt.imshow(rgb_np, alpha=0.5)
-        plt.imshow(depth_np, alpha=0.5)
-        for mess_poly in mess_polys:
-            plt.plot(mess_poly[:, 0], mess_poly[:, 1], 'r-')
-        plt.show()
-
-        # TODO: rotate if needed?
-        mess_mask = np.zeros(depth_np.shape[:2])
-        cv2.drawContours(mess_mask, mess_polys, -1, (1), 1)
-        # expand the mask a bit
-        mess_mask = cv2.dilate(mess_mask, np.ones((5, 5), np.uint8), iterations=1)
-        depths_m = depth_np[np.where(mess_mask == 1)] / 1000
-        nonzero_depths_m = depths_m[np.where(np.logical_and(depths_m > 0, np.isfinite(depths_m)))]
-        depth_m = nonzero_depths_m.mean()
-        if not np.isfinite(depth_m):
-            breakpoint()
-        M = cv2.moments(mess_polys[0])
-        mess_px = int(M["m10"] / M["m00"])
-        mess_py = int(M["m01"] / M["m00"])
-
-        mess_pos_in_cam = np.array(pixel_to_camera_space(rgb_res, mess_px, mess_py, depth=depth_m))  # [x, y, z]
-
-        mess_in_cam = math_helpers.SE3Pose(*mess_pos_in_cam, math_helpers.Quat())
-        # FIXME: why can't we use "GRAV_ALIGNED_BODY_FRAME_NAME" here?
-        cam2body = get_a_tform_b(rgb_res.shot.transforms_snapshot, BODY_FRAME_NAME,
-                                 rgb_res.shot.frame_name_image_sensor)
-        mess_in_body = cam2body * mess_in_cam
-        mess_x = mess_in_body.x
-        mess_y = mess_in_body.y
+        mess_x, mess_y = get_point_f_retry(command_client, robot_state_client, image_client, get_mess,
+                                           y=-0.1, z=0.5,
+                                           pitch=np.deg2rad(20), yaw=-0.7)
 
         # Grasp the hose to DRAG
         walk_to_then_grasp(robot, robot_state_client, image_client, command_client, manipulation_api_client,
@@ -565,7 +577,7 @@ def arm_pull_rope_with_lease(lease_client, image_client, manipulation_api_client
         blocking_arm_command(command_client, RobotCommandBuilder.arm_stow_command())
 
         # Look at the scene
-        walk_to_pose_in_initial_frame(command_client, initial_transforms, x=0, y=0, angle=0)
+        walk_to_pose_in_initial_frame(command_client, initial_transforms, x=-0.1, y=-0.1, angle=0)
 
         # Grasp the hose to DRAG again
         walk_to_then_grasp(robot, robot_state_client, image_client, command_client, manipulation_api_client,

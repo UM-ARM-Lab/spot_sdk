@@ -1,46 +1,17 @@
-from time import sleep
-import cv2
+import json
 
+import cv2
 import matplotlib.pyplot as plt
 import numpy as np
+from PIL import Image
 
-
-def f0(z):
-    # assume no more than 3 obstacles, otherwise the polynomial should be
-    # higher order. I think?
-    return z ** 3 + 2 * z ** 2 + 3 * z + 4
-
-
-def F(z, zetas):
-    """
-    Args:
-        z: complex number, i.e an (x, y) point
-        zetas: list of complex numbers representing the obstacles (centroids)
-    """
-    return f0(z) / np.prod([z - zeta for zeta in zetas])
-
-
-def integrate(tau, zetas):
-    """
-    Integrate F(z)dz from the start point to the goal point
-    Args:
-        tau: a function that can be evaluated from 0 to 1 and returns the path position
-        zetas: list of complex numbers representing the obstacles (centroids)
-    """
-    # numerically integrate F(tau(t))tau'(t)dt from 0 to 1
-    integral = 0
-    dt = 0.01
-    for t in np.arange(0, 1, dt):
-        dz = tau(t + dt) - tau(t)
-        z = tau(t)
-        integral += F(z, zetas) * dz
-    return integral
+from src.detect_regrasp_point import get_polys, DetectionError, detect_regrasp_point
 
 
 def make_tau(start, goal, waypoint):
     def _tau(t):
         """
-        Piecewise linear path: start --> waypoint --> goal.
+        Represents the piecewise linear path: start --> waypoint --> goal.
         The "time" is arbitrary, so we place 0.5 at the waypoint.
         """
         if t <= 0.5:
@@ -51,80 +22,123 @@ def make_tau(start, goal, waypoint):
     return _tau
 
 
-def compare_waypoints(fig, ax, start, goal, waypoint1, waypoint2, zetas):
+def angle_between(w, v):
+    """ Returns the angle in radians between vectors 'v1' and 'v2'"""
+    return np.arctan2(w[1] * v[0] - v[1] * w[0], w[0] * v[0] + w[1] * v[1])
+
+
+def compare_waypoint_homotopy(start, goal, waypoint1, waypoint2, obstacle_centers):
     tau1 = make_tau(start, goal, waypoint1)
     tau2 = make_tau(start, goal, waypoint2)
     windings = []
-    for zeta in zetas:
+    # compute winding number for each obstacle
+    for object_center in obstacle_centers:
         # to compute the winding number for a given obstacle,
         # go from 0 to 1 and compute the angle between
-        # the vector from the obstacle to the path and the +x axis
-        # then integrate these angles and you'll get a total rotation of either 0 or 2pi???
-        dt = 0.01
+        # the vector from the obstacle to the path and the +X axis,
+        # then integrate these angles, and you'll get a total rotation of either 0 or 2pi
+        dt = 0.05
         integral_angle = 0
-        last_angle = None
+        last_vec = None
         for t in np.arange(0, 2, dt):
             if t < 1:
                 z = tau1(t)
             else:
                 z = tau2(2 - t)
-            ax.plot([zeta[0], z[0]], [zeta[1], z[1]], c='y', linewidth=0.5)
-            ax.scatter(z[0], z[1], c='k', s=1)
-            angle = np.arctan2(z[1] - zeta[1], z[0] - zeta[0])
-            if last_angle is not None:
-                integral_angle += (angle - last_angle)
-            last_angle = angle
-        fig.show()
+            vec = z - object_center
+            if last_vec is not None:
+                angle = angle_between(vec, last_vec)
+                integral_angle += angle
+            last_vec = vec
 
         # round to nearest multiple of 2 pi
         winding_number = np.round(integral_angle / (2 * np.pi)) * 2 * np.pi
         windings.append(winding_number)
-    return np.array(windings)
 
-
-def viz_tau(ax, tau, c):
-    xs = []
-    ys = []
-    for t in np.linspace(0, 1, 100):
-        z = tau(t)
-        xs.append(z[0])
-        ys.append(z[1])
-    ax.plot(xs, ys, c=c)
+    windings = np.array(windings)
+    return np.allclose(windings, 0)
 
 
 def main():
-    cv2.waitKey(1)
+    rgb = Image.open("above2.png")
+    rgb_np = np.asarray(rgb)
+    h, w = rgb_np.shape[:2]
+    with open("pred2.json") as f:
+        predictions = json.load(f)
 
-    obstacle_poly = np.array([
-        [1, 0],
-        [0, 1],
-        [-1, 0],
-        [0, -1],
-    ])
+    # Convert the image and predictions into the obstacle, start, goal, and midpoint representations
+    regrasp_detection = detect_regrasp_point(predictions, 10, 40)
+    regrasp_px = regrasp_detection.grasp_px
 
-    zetas = np.array([
-        [0., 0.],
-    ])
-    start = np.array([-2, 0])
-    goal = np.array([2, 0])
+    hose_polys = get_polys(predictions, "vacuum_hose")
+
+    # NOTE: everything is in pixel space here
+    obstacle_polys = get_polys(predictions, "battery")
+    obstacle_centers = []
+    for poly in obstacle_polys:
+        m = np.zeros([h, w], dtype=np.uint8)
+        cv2.drawContours(m, [poly], -1, (255), cv2.FILLED)
+        center = np.mean(np.stack(np.where(m == 255)), axis=1)
+        # for some reason x/y are swapped?
+        center = center[::-1]
+        obstacle_centers.append(center)
+    obstacle_centers = np.array(obstacle_centers)
+
+    # Exhaustively search for the two points on the hose polygon that are furthest apart
+    if len(hose_polys) == 0:
+        raise DetectionError("No vacuum_hose detected")
+    hose_poly = hose_polys[0]
+    max_d = 0
+    for p1 in hose_poly:
+        for p2 in hose_poly:
+            d = np.linalg.norm(p1 - p2)
+            if d > max_d:
+                max_d = d
+                start_px = p1
+                goal_px = p2
 
     fig, ax = plt.subplots()
-    ax.fill(obstacle_poly[:, 0], obstacle_poly[:, 1], c='k')
     ax.axis("equal")
-    ax.set_xlim(-3, 3)
-    ax.set_ylim(-3, 3)
+    ax.set_ylim(-100, h + 100)
+    ax.set_xlim(-100, w + 100)
+    for poly in obstacle_polys:
+        ax.fill(poly[:, 0], poly[:, 1], c='k')
+    for obstacle_center in obstacle_centers:
+        ax.scatter(obstacle_center[0], obstacle_center[1], c='m')
+    ax.scatter(start_px[0], start_px[1], c='g')
+    ax.scatter(regrasp_px[0], regrasp_px[1], c='b')
+    ax.scatter(goal_px[0], goal_px[1], c='g')
+    fig.show()
 
-    same_homo = compare_waypoints(fig, ax, start, goal, np.array([0, 1.4]), np.array([0, 1.6]), zetas)
+    rng = np.random.RandomState(0)
+    while True:
+        # TODO: sample candidate place points such that tau() is entirely collision free
+        candidate_px = rng.uniform(-100, 700)
+        candidate_py = rng.uniform(-100, 600)
+        candidate_place_px = np.array([candidate_px, candidate_py])
 
-    fig, ax = plt.subplots()
-    ax.fill(obstacle_poly[:, 0], obstacle_poly[:, 1], c='k')
-    ax.axis("equal")
-    ax.set_xlim(-3, 3)
-    ax.set_ylim(-3, 3)
+        fig, ax = plt.subplots()
+        ax.axis("equal")
+        ax.set_xlim(-100, 700)
+        ax.set_ylim(-100, 600)
+        ax.plot([start_px[0], regrasp_px[0], goal_px[0]],
+                [start_px[1], regrasp_px[1], goal_px[1]],
+                c='b')
+        ax.plot([start_px[0], candidate_place_px[0], goal_px[0]],
+                [start_px[1], candidate_place_px[1], goal_px[1]],
+                c='r')
+        ax.scatter(obstacle_centers[:, 0], obstacle_centers[:, 1], c='m')
+        fig.show()
 
-    diff_homo = compare_waypoints(fig, ax, start, goal, np.array([0, 1.4]), np.array([0, -1.6]), zetas)
+        is_same = compare_waypoint_homotopy(start_px, goal_px, regrasp_px, candidate_place_px,
+                                            obstacle_centers)
+        print(is_same)
 
-    print(same_homo, diff_homo)
+        is_collision_free = True
+
+        if is_collision_free and not is_same:
+            print(candidate_place_px)
+            break
 
 
 if __name__ == '__main__':
