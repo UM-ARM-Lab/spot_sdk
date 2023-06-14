@@ -63,11 +63,11 @@ def main():
     rgb = Image.open("above2.png")
     rgb_np = np.asarray(rgb)
     h, w = rgb_np.shape[:2]
-    with open("pred2.json") as f:
+    with open("above2.json") as f:
         predictions = json.load(f)
 
     # Convert the image and predictions into the obstacle, start, goal, and midpoint representations
-    regrasp_detection = detect_regrasp_point(predictions, 10, 40)
+    regrasp_detection = detect_regrasp_point(rgb_np, predictions, 50)
     regrasp_px = regrasp_detection.grasp_px
 
     hose_polys = get_polys(predictions, "vacuum_hose")

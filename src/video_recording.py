@@ -1,22 +1,13 @@
 #! /usr/bin/env python
 from __future__ import print_function
 
-import argparse
-import os
 import pathlib
-import re
-import sys
 import threading
-import time
-from threading import Lock
 
 import cv2
-from arm_video_recorder.srv import TriggerVideoRecording, TriggerVideoRecordingResponse
-
-
-#DEFAULT_CAMERA_NAME = '/dev/v4l/by-id/usb-AVerMedia_Technologies__Inc._Live_Gamer_Portable_2_Plus_5500114600612-video-index0'
 
 DEFAULT_CAMERA_NAME = '/dev/v4l/by-id/usb-AVerMedia_Technologies__Inc._Live_Gamer_Portable_2_Plus_1311774402370-video-index0'
+
 
 class VideoRecorder:
     def __init__(self, cap, path_prefix):

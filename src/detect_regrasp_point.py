@@ -14,7 +14,7 @@ from roboflow import Roboflow
 from sklearn.cluster import KMeans
 
 MIN_CONFIDENCE = 0.25
-MODEL_VERSION = 12
+MODEL_VERSION = 13
 
 
 class DetectionError(Exception):
@@ -51,8 +51,8 @@ def get_or_load_predictions(model, test_image_filename):
 
 
 def viz_detection(rgb_np, detection):
-    plt.figure()
-    plt.imshow(rgb_np)
+    fig, ax = plt.subplots()
+    ax.imshow(rgb_np)
     rng = np.random.RandomState(0)
     class_colors = {}
     for pred in detection.predictions:
@@ -63,14 +63,16 @@ def viz_detection(rgb_np, detection):
         x = [p['x'] for p in points]
         y = [p['y'] for p in points]
         c = class_colors[class_name]
-        plt.plot(x, y, c=c, linewidth=2, zorder=1)
-    plt.scatter(detection.candidates_pxs[:, 0], detection.candidates_pxs[:, 1], color="y", marker="x", s=100,
+        ax.plot(x, y, c=c, linewidth=2, zorder=1)
+    ax.scatter(detection.candidates_pxs[:, 0], detection.candidates_pxs[:, 1], color="y", marker="x", s=100,
                 label='candidates',
                 zorder=2)
-    plt.scatter(detection.grasp_px[0], detection.grasp_px[1], color="green", marker="o", s=100, label='grasp point',
+    ax.scatter(detection.grasp_px[0], detection.grasp_px[1], color="green", marker="o", s=100, label='grasp point',
                 zorder=3)
-    plt.legend()
-    plt.show()
+    ax.legend()
+    fig.show()
+
+    return fig, ax
 
 
 def get_polys(predictions, desired_class_name):
@@ -79,12 +81,20 @@ def get_polys(predictions, desired_class_name):
         if pred['confidence'] < MIN_CONFIDENCE:
             continue
         class_name = pred["class"]
-        points = pred["points"]
-        points = np.array([(p['x'], p['y']) for p in points], dtype=int)
+        points = pred_to_poly(pred)
 
-        if class_name == desired_class_name:
+        if isinstance(desired_class_name, list):
+            if class_name in desired_class_name:
+                polys.append(points)
+        elif class_name == desired_class_name:
             polys.append(points)
     return polys
+
+
+def pred_to_poly(pred):
+    points = pred["points"]
+    points = np.array([(p['x'], p['y']) for p in points], dtype=int)
+    return points
 
 
 def get_predictions(model, test_image_filename):
@@ -93,7 +103,7 @@ def get_predictions(model, test_image_filename):
     return predictions
 
 
-def get_points_within_dist(far_px, input_pxs, near_px, obstacle_polygons):
+def get_points_within_dist(input_pxs, obstacle_polygons, near_px, far_px):
     candidates_pxs = []
     for hose_p in input_pxs:
         min_d_to_any_obstacle = min_dist_to_obstacles(obstacle_polygons, hose_p)
@@ -115,7 +125,7 @@ def detect_regrasp_point_old(predictions, near_px, far_px):
     obstacle_polygons = get_polys(predictions, obstacle_class_name)
 
     input_pxs = np.concatenate(hose_polygons, axis=0)
-    candidates_pxs = get_points_within_dist(far_px, input_pxs, near_px, obstacle_polygons)
+    candidates_pxs = get_points_within_dist(input_pxs, obstacle_polygons, near_px, far_px)
 
     # compute the distance to the camera, approximated by the distance to the bottom-center of th image
     # for each candidate point.
@@ -145,9 +155,9 @@ def detect_object_center(predictions, class_name):
     return detection
 
 
-def fit_hose_model(hose_polygons):
+def fit_hose_model(hose_polygons, n_clusters=8):
     hose_points = np.concatenate(hose_polygons, 0)
-    kmeans = KMeans(n_clusters=6, random_state=0, n_init="auto").fit(hose_points)
+    kmeans = KMeans(n_clusters=n_clusters, random_state=0, n_init="auto").fit(hose_points)
     clusters = kmeans.cluster_centers_
 
     # organize the points into line segments with the shortest total length
@@ -168,40 +178,54 @@ def fit_hose_model(hose_polygons):
     return best_ordered_hose_points
 
 
-def detect_regrasp_point(predictions, ideal_dist_to_obs):
+def detect_regrasp_point(rgb_np, predictions, ideal_dist_to_obs, angles_weight=0.5):
     hose_class_name = "vacuum_hose"
     obstacle_class_name = "battery"
 
     hose_polygons = get_polys(predictions, hose_class_name)
     obstacle_polygons = get_polys(predictions, obstacle_class_name)
 
+    if len(hose_polygons) == 0:
+        raise DetectionError("no hose detected")
+
     ordered_hose_points = fit_hose_model(hose_polygons)
     n = ordered_hose_points.shape[0]
 
     # Find the angle of each segment in the hose with respect to the X axis, between -pi/2 and pi/2.
-    # Pick the point which minimizes the following cost
-    # alpha * angle of hose at point + (1 - alpha) * abs(dist_to_obstacle - ideal_dist_to_obstacle)
+    # Pick the point which minimizes cost.
 
-    alpha = 0.5
     deltas = ordered_hose_points[1:] - ordered_hose_points[:-1]
     angles_costs = np.zeros(n)
-    flat_hose_points = []
     for i in range(n):
         if i == 0:
             delta = deltas[0]
         if i > 0:
             delta = deltas[i - 1]
         angle = min_angle_to_x_axis(delta)
-        angles_costs[i] = abs(angle)
+        angles_costs[i] = np.rad2deg(abs(angle))  # convert to degrees for interpretability and to scale up values
 
     dist_costs = np.zeros(n)
     for i, p in enumerate(ordered_hose_points):
         min_d_to_any_obstacle = min_dist_to_obstacles(obstacle_polygons, p)
         dist_costs[i] = abs(min_d_to_any_obstacle - ideal_dist_to_obs)
 
-    total_cost = alpha * angles_costs + (1 - alpha) * dist_costs
+    total_cost = angles_weight * angles_costs + (1 - angles_weight) * dist_costs
     min_cost_idx = np.argmin(total_cost)
     best_px = ordered_hose_points[min_cost_idx]
+
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots()
+    ax.imshow(rgb_np)
+    for pred in predictions:
+        xs = [p['x'] for p in pred['points']]
+        ys = [p['y'] for p in pred['points']]
+        ax.plot(xs, ys)
+    cost_normalized = (total_cost - total_cost.min()) / (total_cost.max() - total_cost.min())
+    for cost, p in zip(cost_normalized, ordered_hose_points):
+        color = cm.hsv(cost)
+        ax.scatter(p[0], p[1], color=color, zorder=3)
+    ax.scatter(best_px[0], best_px[1], s=100, marker='*', c='m', zorder=4)
+    fig.show()
 
     return DetectionResult(best_px, ordered_hose_points, predictions)
 

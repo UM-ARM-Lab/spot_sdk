@@ -1,0 +1,9 @@
+matplotlib
+numpy
+opencv-python
+Pillow
+requests
+rerun-sdk
+roboflow
+scikit-learn
+scipy
