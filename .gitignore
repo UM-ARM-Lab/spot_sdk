@@ -7,3 +7,6 @@ __pycache__
 video
 *.mp4
 *.avi
+src/data
+src/video
+*.zip

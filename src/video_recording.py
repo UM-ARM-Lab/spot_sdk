@@ -10,18 +10,17 @@ DEFAULT_CAMERA_NAME = '/dev/v4l/by-id/usb-AVerMedia_Technologies__Inc._Live_Game
 
 
 class VideoRecorder:
-    def __init__(self, cap, path_prefix):
-        self.out_filename = None
+    def __init__(self, device_num, path_prefix='video/'):
+        self.device_num = device_num
+        self.path_prefix = path_prefix
+        self.cap = cv2.VideoCapture(device_num)
         self.thread = None
         self.exit = None
-
-        self.out = None
-        self.cap = cap
-        self.path_prefix = path_prefix
+        self.writer = None
 
     def stop_current_recording(self):
-        if self.out is not None:
-            self.out.release()
+        if self.writer is not None:
+            self.writer.release()
             print("Stopping current recording")
         self.is_recording = False
 
@@ -45,7 +44,7 @@ class VideoRecorder:
 
         self.is_recording = True
 
-        self.out = cv2.VideoWriter(str(path), fourcc_code, fps, frame_dims)
+        self.writer = cv2.VideoWriter(str(path), fourcc_code, fps, frame_dims)
         return True
 
     def start_in_thread(self):
@@ -54,7 +53,7 @@ class VideoRecorder:
 
             while not self.exit:
                 ret, frame = self.cap.read()
-                self.out.write(frame)
+                self.writer.write(frame)
 
         self.thread = threading.Thread(target=_target)
         self.thread.start()

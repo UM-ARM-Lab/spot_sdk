@@ -13,8 +13,8 @@ from PIL import Image
 from roboflow import Roboflow
 from sklearn.cluster import KMeans
 
-MIN_CONFIDENCE = 0.25
-MODEL_VERSION = 13
+MIN_CONFIDENCE = 0.15
+MODEL_VERSION = 14
 
 
 class DetectionError(Exception):
@@ -65,10 +65,10 @@ def viz_detection(rgb_np, detection):
         c = class_colors[class_name]
         ax.plot(x, y, c=c, linewidth=2, zorder=1)
     ax.scatter(detection.candidates_pxs[:, 0], detection.candidates_pxs[:, 1], color="y", marker="x", s=100,
-                label='candidates',
-                zorder=2)
+               label='candidates',
+               zorder=2)
     ax.scatter(detection.grasp_px[0], detection.grasp_px[1], color="green", marker="o", s=100, label='grasp point',
-                zorder=3)
+               zorder=3)
     ax.legend()
     fig.show()
 
@@ -117,25 +117,6 @@ def get_points_within_dist(input_pxs, obstacle_polygons, near_px, far_px):
     return candidates_pxs
 
 
-def detect_regrasp_point_old(predictions, near_px, far_px):
-    hose_class_name = "vacuum_hose"
-    obstacle_class_name = "battery"
-
-    hose_polygons = get_polys(predictions, hose_class_name)
-    obstacle_polygons = get_polys(predictions, obstacle_class_name)
-
-    input_pxs = np.concatenate(hose_polygons, axis=0)
-    candidates_pxs = get_points_within_dist(input_pxs, obstacle_polygons, near_px, far_px)
-
-    # compute the distance to the camera, approximated by the distance to the bottom-center of th image
-    # for each candidate point.
-    # FIXME: hard coded jank
-    d_to_center = np.linalg.norm(candidates_pxs - np.array([320, 400]), axis=-1)
-    grasp_px = candidates_pxs[np.argmin(d_to_center)]
-
-    return DetectionResult(grasp_px, candidates_pxs, predictions)
-
-
 def detect_object_center(predictions, class_name):
     polygons = get_polys(predictions, class_name)
 
@@ -156,7 +137,9 @@ def detect_object_center(predictions, class_name):
 
 
 def fit_hose_model(hose_polygons, n_clusters=8):
+    # 8 is the max we can do exhaustively, since it grows exponentially!
     hose_points = np.concatenate(hose_polygons, 0)
+    n_clusters = int(min(n_clusters, hose_points.shape[0] / 2))
     kmeans = KMeans(n_clusters=n_clusters, random_state=0, n_init="auto").fit(hose_points)
     clusters = kmeans.cluster_centers_
 
@@ -178,17 +161,24 @@ def fit_hose_model(hose_polygons, n_clusters=8):
     return best_ordered_hose_points
 
 
+def hose_points_from_predictions(predictions):
+    # FIXME: remove blue_rope class!
+    hose_polys = get_polys(predictions, ["vacuum_hose", "vacuum_neck", "blue_rope"])
+    if len(hose_polys) == 0:
+        raise DetectionError("No hose detected")
+    ordered_hose_points = fit_hose_model(hose_polys)
+    return ordered_hose_points
+
+
 def detect_regrasp_point(rgb_np, predictions, ideal_dist_to_obs, angles_weight=0.5):
-    hose_class_name = "vacuum_hose"
-    obstacle_class_name = "battery"
+    ordered_hose_points = hose_points_from_predictions(predictions)
+    min_cost_idx, best_px = detect_regrasp_point_from_hose(rgb_np, predictions, ideal_dist_to_obs, ordered_hose_points,
+                                                           angles_weight)
 
-    hose_polygons = get_polys(predictions, hose_class_name)
-    obstacle_polygons = get_polys(predictions, obstacle_class_name)
+    return DetectionResult(best_px, ordered_hose_points, predictions)
 
-    if len(hose_polygons) == 0:
-        raise DetectionError("no hose detected")
 
-    ordered_hose_points = fit_hose_model(hose_polygons)
+def detect_regrasp_point_from_hose(rgb_np, predictions, ideal_dist_to_obs, ordered_hose_points, angles_weight=0.5):
     n = ordered_hose_points.shape[0]
 
     # Find the angle of each segment in the hose with respect to the X axis, between -pi/2 and pi/2.
@@ -205,6 +195,11 @@ def detect_regrasp_point(rgb_np, predictions, ideal_dist_to_obs, angles_weight=0
         angles_costs[i] = np.rad2deg(abs(angle))  # convert to degrees for interpretability and to scale up values
 
     dist_costs = np.zeros(n)
+
+    obstacle_class_name = "battery"
+    obstacle_polygons = get_polys(predictions, obstacle_class_name)
+    if len(obstacle_polygons) == 0:
+        raise DetectionError(f"No {obstacle_class_name} detected")
     for i, p in enumerate(ordered_hose_points):
         min_d_to_any_obstacle = min_dist_to_obstacles(obstacle_polygons, p)
         dist_costs[i] = abs(min_d_to_any_obstacle - ideal_dist_to_obs)
@@ -227,7 +222,7 @@ def detect_regrasp_point(rgb_np, predictions, ideal_dist_to_obs, angles_weight=0
     ax.scatter(best_px[0], best_px[1], s=100, marker='*', c='m', zorder=4)
     fig.show()
 
-    return DetectionResult(best_px, ordered_hose_points, predictions)
+    return min_cost_idx, best_px
 
 
 def min_dist_to_obstacles(obstacle_polygons, p):
