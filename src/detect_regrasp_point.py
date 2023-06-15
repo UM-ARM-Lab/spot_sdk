@@ -103,20 +103,6 @@ def get_predictions(model, test_image_filename):
     return predictions
 
 
-def get_points_within_dist(input_pxs, obstacle_polygons, near_px, far_px):
-    candidates_pxs = []
-    for hose_p in input_pxs:
-        min_d_to_any_obstacle = min_dist_to_obstacles(obstacle_polygons, hose_p)
-        # a point is a candidate if it is within some distance of an obstacle
-        if near_px < min_d_to_any_obstacle < far_px:
-            candidates_pxs.append(hose_p)
-    if len(candidates_pxs) == 0:
-        raise DetectionError("No regrasp point candidates found")
-
-    candidates_pxs = np.array(candidates_pxs)
-    return candidates_pxs
-
-
 def detect_object_center(predictions, class_name):
     polygons = get_polys(predictions, class_name)
 
@@ -170,29 +156,15 @@ def hose_points_from_predictions(predictions):
     return ordered_hose_points
 
 
-def detect_regrasp_point(rgb_np, predictions, ideal_dist_to_obs, angles_weight=0.5):
+def detect_regrasp_point(rgb_np, predictions, ideal_dist_to_obs):
     ordered_hose_points = hose_points_from_predictions(predictions)
-    min_cost_idx, best_px = detect_regrasp_point_from_hose(rgb_np, predictions, ideal_dist_to_obs, ordered_hose_points,
-                                                           angles_weight)
+    min_cost_idx, best_px = detect_regrasp_point_from_hose(rgb_np, predictions, ideal_dist_to_obs, ordered_hose_points)
 
     return DetectionResult(best_px, ordered_hose_points, predictions)
 
 
-def detect_regrasp_point_from_hose(rgb_np, predictions, ideal_dist_to_obs, ordered_hose_points, angles_weight=0.5):
+def detect_regrasp_point_from_hose(rgb_np, predictions, ideal_dist_to_obs, ordered_hose_points):
     n = ordered_hose_points.shape[0]
-
-    # Find the angle of each segment in the hose with respect to the X axis, between -pi/2 and pi/2.
-    # Pick the point which minimizes cost.
-
-    deltas = ordered_hose_points[1:] - ordered_hose_points[:-1]
-    angles_costs = np.zeros(n)
-    for i in range(n):
-        if i == 0:
-            delta = deltas[0]
-        if i > 0:
-            delta = deltas[i - 1]
-        angle = min_angle_to_x_axis(delta)
-        angles_costs[i] = np.rad2deg(abs(angle))  # convert to degrees for interpretability and to scale up values
 
     dist_costs = np.zeros(n)
 
@@ -204,7 +176,7 @@ def detect_regrasp_point_from_hose(rgb_np, predictions, ideal_dist_to_obs, order
         min_d_to_any_obstacle = min_dist_to_obstacles(obstacle_polygons, p)
         dist_costs[i] = abs(min_d_to_any_obstacle - ideal_dist_to_obs)
 
-    total_cost = angles_weight * angles_costs + (1 - angles_weight) * dist_costs
+    total_cost = dist_costs
     min_cost_idx = np.argmin(total_cost)
     best_px = ordered_hose_points[min_cost_idx]
 
@@ -250,12 +222,11 @@ def main():
     test_image_filename = "above3.png"
     predictions = get_predictions(model, test_image_filename)
 
-    detection = detect_regrasp_point(predictions, 50)
-
     rgb_pil = Image.open(test_image_filename)
     rgb_np = np.asarray(rgb_pil)
 
-    viz_detection(rgb_pil, detection)
+    detection = detect_regrasp_point(rgb_np, predictions, ideal_dist_to_obs=50)
+    print(detection)
 
 
 if __name__ == "__main__":

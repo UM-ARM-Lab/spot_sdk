@@ -10,65 +10,27 @@ import bosdyn.client.util
 import numpy as np
 import rerun as rr
 from bosdyn import geometry
-from bosdyn.api import geometry_pb2, arm_command_pb2, synchronized_command_pb2, robot_command_pb2, \
-    manipulation_api_pb2
+from bosdyn.api import geometry_pb2, manipulation_api_pb2
 from bosdyn.api.basic_command_pb2 import RobotCommandFeedbackStatus
 from bosdyn.api.spot import robot_command_pb2 as spot_command_pb2
 from bosdyn.client import math_helpers
 from bosdyn.client.frame_helpers import ODOM_FRAME_NAME, GRAV_ALIGNED_BODY_FRAME_NAME, get_a_tform_b, get_se2_a_tform_b, \
-    BODY_FRAME_NAME, HAND_FRAME_NAME
+    HAND_FRAME_NAME
 from bosdyn.client.image import ImageClient, pixel_to_camera_space
 from bosdyn.client.manipulation_api_client import ManipulationApiClient
-from bosdyn.client.robot_command import (RobotCommandBuilder, RobotCommandClient, blocking_stand,
-                                         block_for_trajectory_cmd, block_until_arm_arrives)
+from bosdyn.client.robot_command import (RobotCommandBuilder, block_for_trajectory_cmd)
 from bosdyn.client.robot_state import RobotStateClient
 from google.protobuf import wrappers_pb2
 
 from src.detect_regrasp_point import DetectionError, min_angle_to_x_axis
 from src.get_funcs import GetRetryResult, get_hose_and_head_point, get_hose_and_regrasp_point, get_mess
+from src.utils import blocking_arm_command, block_for_manipulation_api_command, setup_and_stand, rot_2d
 
 HIGH_FORCE_THRESHOLD = 16
 FORCE_BUFFER_SIZE = 15
 
 
-def blocking_arm_command(command_client, cmd):
-    block_until_arm_arrives(command_client, command_client.robot_command(cmd))
-    # FIXME: why is this needed???
-    command_client.robot_command(RobotCommandBuilder.stop_command())
-
-
-def block_for_manipulation_api_command(robot, manipulation_api_client, cmd_response):
-    while True:
-        time.sleep(0.25)
-        feedback_request = manipulation_api_pb2.ManipulationApiFeedbackRequest(
-            manipulation_cmd_id=cmd_response.manipulation_cmd_id)
-
-        # Send the request
-        response = manipulation_api_client.manipulation_api_feedback_command(
-            manipulation_api_feedback_request=feedback_request)
-
-        state_name = manipulation_api_pb2.ManipulationFeedbackState.Name(response.current_state)
-        robot.logger.info(f'Current state: {state_name}')
-
-        if response.current_state == manipulation_api_pb2.MANIP_STATE_DONE:
-            break
-
-    robot.logger.info('Finished.')
-
-
-def make_robot_command(arm_joint_traj):
-    """ Helper function to create a RobotCommand from an ArmJointTrajectory.
-        The returned command will be a SynchronizedCommand with an ArmJointMoveCommand
-        filled out to follow the passed in trajectory. """
-
-    joint_move_command = arm_command_pb2.ArmJointMoveCommand.Request(trajectory=arm_joint_traj)
-    arm_command = arm_command_pb2.ArmCommand.Request(arm_joint_move_command=joint_move_command)
-    sync_arm = synchronized_command_pb2.SynchronizedCommand.Request(arm_command=arm_command)
-    arm_sync_robot_cmd = robot_command_pb2.RobotCommand(synchronized_command=sync_arm)
-    return RobotCommandBuilder.build_synchro_command(arm_sync_robot_cmd)
-
-
-def look_at_command(robot_state_client, x, y, z, roll=0, pitch=np.pi / 2, yaw=0, duration=0.5):
+def look_at_command(robot_state_client, x, y, z, roll=0., pitch=np.pi / 2, yaw=0., duration=0.5):
     """
     Move the arm to a pose relative to the body
 
@@ -123,18 +85,6 @@ def force_measure(state_client, command_client, force_buffer: List):
         command_client.robot_command(RobotCommandBuilder.stop_command())
         return True
     return False
-
-
-def setup_and_stand(robot):
-    robot.logger.info("Powering on robot... This may take a several seconds.")
-    robot.power_on(timeout_sec=20)
-    assert robot.is_powered_on(), "Robot power on failed."
-    robot.logger.info("Robot powered on.")
-    robot.logger.info("Commanding robot to stand...")
-    command_client = robot.ensure_client(RobotCommandClient.default_service_name)
-    blocking_stand(command_client, timeout_sec=10)
-    robot.logger.info("Robot standing.")
-    return command_client
 
 
 def pose_in_start_frame(initial_transforms, x, y, angle):
@@ -200,23 +150,6 @@ def walk_to_pose_in_initial_frame(command_client, initial_transforms, x=0., y=0.
     if block:
         block_for_trajectory_cmd(command_client, se2_cmd_id)
     return se2_cmd_id
-
-
-def rotate_image_coordinates(pts, width, height, rot):
-    """
-    Rotate image coordinates by rot degrees around the center of the image.
-
-    Args:
-        pts: Nx2 array of image coordinates
-        width: width of image
-        height: height of image
-        rot: rotation in degrees
-    """
-    center = np.array([width / 2, height / 2])
-    rot = np.deg2rad(rot)
-    R = np.array([[np.cos(rot), -np.sin(rot)], [np.sin(rot), np.cos(rot)]])
-    new_pts = center + (pts - center) @ R.T
-    return new_pts
 
 
 def get_point_f_retry(command_client, robot_state_client, image_client, get_point_f: Callable,
@@ -351,13 +284,6 @@ def align_with_hose(command_client, get_point_f, image_client, robot_state_clien
     block_for_trajectory_cmd(command_client, se2_cmd_id)
     return pick_res, angle
 
-
-def rot_2d(angle):
-    R = np.array([
-        [np.cos(angle), -np.sin(angle)],
-        [np.sin(angle), np.cos(angle)],
-    ])
-    return R
 
 
 def arm_pull_rope(config):
