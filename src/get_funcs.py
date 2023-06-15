@@ -16,7 +16,9 @@ from bosdyn.client.image import build_image_request, pixel_to_camera_space
 from scipy import ndimage
 
 from src.detect_regrasp_point import MODEL_VERSION, get_polys, DetectionError, hose_points_from_predictions, \
-    detect_object_center, viz_detection, detect_regrasp_point_from_hose
+    detect_object_center, viz_detection, detect_regrasp_point_from_hose, MIN_CONFIDENCE
+
+DEFAULT_IDEAL_DIST_TO_OBS = 70
 
 ROTATION_ANGLE = {
     'back_fisheye_image': 0,
@@ -96,8 +98,8 @@ def get_depth_img(image_client, src):
 
 
 def get_predictions(rgb_np):
-    img_str = base64.b64encode(cv2.imencode('.jpg', rgb_np)[1])
-    upload_url = f"https://detect.roboflow.com/spot-vaccuming-demo/{MODEL_VERSION}?api_key={os.environ['ROBOFLOW_API_KEY']}"
+    img_str = base64.b64encode(cv2.imencode('.png', rgb_np)[1])
+    upload_url = f"https://detect.roboflow.com/spot-vaccuming-demo/{MODEL_VERSION}?confidence={int(100 * MIN_CONFIDENCE)}&api_key={os.environ['ROBOFLOW_API_KEY']}"
     resp = requests.post(upload_url, data=img_str, headers={
         "Content-Type": "application/x-www-form-urlencoded"
     }, stream=True).json()
@@ -133,7 +135,6 @@ def get_mess(image_client):
         print(f"Error: expected 1 mess, got {len(mess_polys)}")
 
     import matplotlib.pyplot as plt
-    # Image.fromarray(rgb_np).save(f"mess_{int(time.time())}.png")
     fig, ax = plt.subplots()
     ax.imshow(rgb_np, alpha=0.5, zorder=0)
     ax.imshow(depth_np, alpha=0.5, zorder=1)
@@ -202,7 +203,7 @@ def get_hose_and_head_point(image_client):
     return GetRetryResult(rgb_res, hose_points, best_idx, best_vec2)
 
 
-def get_hose_and_regrasp_point(image_client, ideal_dist_to_obs=50):
+def get_hose_and_regrasp_point(image_client, ideal_dist_to_obs=DEFAULT_IDEAL_DIST_TO_OBS):
     time.sleep(1)  # reduces motion blur?
     rgb_np, rgb_res = get_color_img(image_client, 'hand_color_image')
     depth_np, depth_res = get_depth_img(image_client, 'hand_depth_in_hand_color_frame')

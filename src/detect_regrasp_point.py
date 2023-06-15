@@ -1,8 +1,6 @@
 import itertools
-import json
 import os
 from dataclasses import dataclass
-from pathlib import Path
 from typing import List, Dict
 
 import cv2
@@ -13,8 +11,8 @@ from PIL import Image
 from roboflow import Roboflow
 from sklearn.cluster import KMeans
 
-MIN_CONFIDENCE = 0.15
-MODEL_VERSION = 14
+MIN_CONFIDENCE = 0.10
+MODEL_VERSION = 18
 
 
 class DetectionError(Exception):
@@ -36,18 +34,19 @@ def init_roboflow():
 
 
 def get_or_load_predictions(model, test_image_filename):
-    image_path = Path(test_image_filename)
-    predictions_path = Path(f"{image_path.stem}_pred.json")
-    if predictions_path.exists():
-        with predictions_path.open("r") as f:
-            predictions = json.load(f)
-    else:
-        predictions = model.predict(test_image_filename).json()
-
-        with predictions_path.open("w") as f:
-            json.dump(predictions, f)
-
+    predictions = model.predict(test_image_filename, confidence=MIN_CONFIDENCE).json()
     return predictions
+    # image_path = Path(test_image_filename)
+    # predictions_path = Path(f"{image_path.stem}_pred.json")
+    # if predictions_path.exists():
+    #     with predictions_path.open("r") as f:
+    #         predictions = json.load(f)
+    # else:
+    #
+    #     with predictions_path.open("w") as f:
+    #         json.dump(predictions, f)
+    #
+    # return predictions
 
 
 def viz_detection(rgb_np, detection):
@@ -184,9 +183,8 @@ def detect_regrasp_point_from_hose(rgb_np, predictions, ideal_dist_to_obs, order
     fig, ax = plt.subplots()
     ax.imshow(rgb_np)
     for pred in predictions:
-        xs = [p['x'] for p in pred['points']]
-        ys = [p['y'] for p in pred['points']]
-        ax.plot(xs, ys)
+        points = pred_to_poly(pred)
+        ax.plot(points[:, 0], points[:, 1])
     cost_normalized = (total_cost - total_cost.min()) / (total_cost.max() - total_cost.min())
     for cost, p in zip(cost_normalized, ordered_hose_points):
         color = cm.hsv(cost)
@@ -219,7 +217,7 @@ def min_angle_to_x_axis(delta):
 def main():
     model = init_roboflow()
 
-    test_image_filename = "above3.png"
+    test_image_filename = "/home/armlab/spot_sdk/src/data/1686856761/rgb.png"
     predictions = get_predictions(model, test_image_filename)
 
     rgb_pil = Image.open(test_image_filename)

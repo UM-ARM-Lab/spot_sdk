@@ -102,7 +102,7 @@ def pose_in_start_frame(initial_transforms, x, y, angle):
     return pose_in_odom
 
 
-def look_at_scene(command_client, robot_state_client, x=0.55, y=0.1, z=0.55, pitch=0., yaw=0., dx=0., dy=0., dpitch=0.):
+def look_at_scene(command_client, robot_state_client, x=0.56, y=0.1, z=0.55, pitch=0., yaw=0., dx=0., dy=0., dpitch=0.):
     look_cmd = look_at_command(robot_state_client, x + dx, y + dy, z,
                                0, pitch + dpitch, yaw,
                                duration=0.5)
@@ -117,7 +117,7 @@ def drag_rope_to_goal(robot_state_client, command_client, initial_transforms, x,
 
     # Create the se2 trajectory for the dragging motion
     walk_cmd_id = walk_to_pose_in_initial_frame(command_client, initial_transforms, x=x, y=y, angle=angle,
-                                                block=False)
+                                                block=False, crawl=True)
 
     # loop to check forces
     while True:
@@ -132,19 +132,24 @@ def drag_rope_to_goal(robot_state_client, command_client, initial_transforms, x,
             print("Arrived at goal.")
             return True
         if force_measure(robot_state_client, command_client, force_buffer):
+            time.sleep(1)  # makes the video look better in my opinion
             print("High force detected. Failed to reach goal.")
             return False
         time.sleep(0.25)
 
 
-def walk_to_pose_in_initial_frame(command_client, initial_transforms, x=0., y=0., angle=0., block=True):
+def walk_to_pose_in_initial_frame(command_client, initial_transforms, x=0., y=0., angle=0., block=True, crawl=False):
     """
     Non-blocking, returns the command id
     """
     goal_pose_in_odom = pose_in_start_frame(initial_transforms, x=x, y=y, angle=angle)
+    if crawl:
+        locomotion_hint = spot_command_pb2.HINT_CRAWL
+    else:
+        locomotion_hint = spot_command_pb2.HINT_AUTO
     se2_cmd = RobotCommandBuilder.synchro_se2_trajectory_command(goal_se2=goal_pose_in_odom.to_proto(),
                                                                  frame_name=ODOM_FRAME_NAME,
-                                                                 locomotion_hint=spot_command_pb2.HINT_CRAWL)
+                                                                 locomotion_hint=locomotion_hint)
     se2_synchro_commnd = RobotCommandBuilder.build_synchro_command(se2_cmd)
     se2_cmd_id = command_client.robot_command(lease=None, command=se2_synchro_commnd, end_time_secs=time.time() + 999)
     if block:
@@ -240,13 +245,16 @@ def align_with_hose(command_client, get_point_f, image_client, robot_state_clien
 
     # Compute the angle of the hose around the given point using finite differencing
     if best_idx == 0:
-        angle = min_angle_to_x_axis(hose_points[best_idx] - hose_points[best_idx + 1])
+        angle1 = min_angle_to_x_axis(hose_points[best_idx] - hose_points[best_idx + 1])
+        angle2 = min_angle_to_x_axis(hose_points[best_idx + 1] - hose_points[best_idx + 2])
     elif best_idx == len(hose_points) - 1:
-        angle = min_angle_to_x_axis(hose_points[best_idx] - hose_points[best_idx - 1])
+        angle1 = min_angle_to_x_axis(hose_points[best_idx] - hose_points[best_idx - 1])
+        angle2 = min_angle_to_x_axis(hose_points[best_idx - 1] - hose_points[best_idx - 2])
     else:
         angle1 = min_angle_to_x_axis(hose_points[best_idx] - hose_points[best_idx - 1])
         angle2 = min_angle_to_x_axis(hose_points[best_idx] - hose_points[best_idx + 1])
-        angle = (angle1 + angle2) / 2
+
+    angle = (angle1 + angle2) / 2
     # The angles to +X in pixel space are "flipped" because images are stored with Y increasing downwards
     angle = -angle
 
@@ -254,27 +262,40 @@ def align_with_hose(command_client, get_point_f, image_client, robot_state_clien
         print("Not rotating because angle is small")
         return pick_res, angle
 
-    transforms = robot_state_client.get_robot_state().kinematic_state.transforms_snapshot
-
     # This is the point we want to rotate around
     best_px = hose_points[best_idx]
 
     # convert to camera frame and ignore the Z. Assumes the camera is pointed straight down.
     best_pt_in_cam = np.array(pixel_to_camera_space(pick_res.image_res, best_px[0], best_px[1], depth=1.0))[:2]
-    print(f'{best_pt_in_cam=}')
     # Camera frame is not the same as the frame of the hand, so we do a hacky conversion
     best_pt_in_hand = np.array([-best_pt_in_cam[1], -best_pt_in_cam[0]])
-    print(f'{best_pt_in_hand=}')
 
+    rotate_around_point_in_hand_frame(command_client, robot_state_client, best_pt_in_hand, angle)
+    return pick_res, angle
+
+
+def rotate_around_point_in_hand_frame(command_client, robot_state_client, pos: np.ndarray, angle: float):
+    """
+    Moves the body by `angle` degrees, and translate so that `pos` stays in the same place.
+
+    Assumptions:
+     - the hand and the body have aligned X axes
+
+    Args:
+        command_client: command client
+        robot_state_client: robot state client
+        pos: 2D position of the point to rotate around, in the hand frame
+        angle: angle in radians to rotate the body by, around the Z axis
+    """
+    transforms = robot_state_client.get_robot_state().kinematic_state.transforms_snapshot
     hand_in_odom = get_se2_a_tform_b(transforms, ODOM_FRAME_NAME, HAND_FRAME_NAME)
     hand_in_body = get_se2_a_tform_b(transforms, GRAV_ALIGNED_BODY_FRAME_NAME, HAND_FRAME_NAME)
     body_in_hand = hand_in_body.inverse()  # NOTE: querying frames in opposite order returns None???
     body_pt_in_hand = np.array([body_in_hand.x, body_in_hand.y])
-    rotated_body_pos_in_hand = rot_2d(angle) @ body_pt_in_hand + best_pt_in_hand
+    rotated_body_pos_in_hand = rot_2d(angle) @ body_pt_in_hand + pos
     rotated_body_in_hand = math_helpers.SE2Pose(rotated_body_pos_in_hand[0], rotated_body_pos_in_hand[1],
                                                 angle + body_in_hand.angle)
     goal_in_odom = hand_in_odom * rotated_body_in_hand
-
     se2_cmd = RobotCommandBuilder.synchro_se2_trajectory_command(goal_se2=goal_in_odom.to_proto(),
                                                                  frame_name=ODOM_FRAME_NAME,
                                                                  locomotion_hint=spot_command_pb2.HINT_CRAWL)
@@ -282,8 +303,6 @@ def align_with_hose(command_client, get_point_f, image_client, robot_state_clien
     se2_cmd_id = command_client.robot_command(lease=None, command=se2_synchro_commnd,
                                               end_time_secs=time.time() + 999)
     block_for_trajectory_cmd(command_client, se2_cmd_id)
-    return pick_res, angle
-
 
 
 def arm_pull_rope(config):
@@ -330,73 +349,76 @@ def arm_pull_rope_with_lease(lease_client, image_client, manipulation_api_client
 
         # first detect the goal
         mess_x, mess_y = get_point_f_retry(command_client, robot_state_client, image_client, get_mess,
-                                           y=-0.1, z=0.5,
-                                           pitch=np.deg2rad(20), yaw=-0.6)
+                                           y=-0.05, z=0.5,
+                                           pitch=np.deg2rad(20), yaw=-0.3)
         # offset from the mess because it looks better
-        mess_x -= 0.25
-        mess_y -= 0.4
+        pre_mess_x = mess_x - 0.35
+        pre_mess_y = mess_y - 0.4
 
-        # Grasp the hose to DRAG
-        # TODO: instead of looking for the centroid of the vacuum head class,
-        #  what if we fit the hose model using the combination of all the classes (hose, head, neck)
-        #  and then find a point that's like 95% the way towards the head?
-        walk_to_then_grasp(robot, robot_state_client, image_client, command_client, manipulation_api_client,
-                           get_hose_and_head_point)
+        while True:
+            # Grasp the hose to DRAG
+            walk_to_then_grasp(robot, robot_state_client, image_client, command_client, manipulation_api_client,
+                               get_hose_and_head_point)
 
-        goal_reached = drag_rope_to_goal(robot_state_client, command_client, initial_transforms, mess_x, mess_y,
-                                         np.pi / 2)
-        time.sleep(1)  # makes the video look better in my opinion
-        if goal_reached:
-            robot.logger.info("Goal reached!")
-            return
+            goal_reached = drag_rope_to_goal(robot_state_client, command_client, initial_transforms,
+                                             pre_mess_x, pre_mess_y,
+                                             np.pi / 2)
+            if goal_reached:
+                break
 
-        command_client.robot_command(RobotCommandBuilder.claw_gripper_open_command())
-        time.sleep(1)
-        # FIXME: block until gripper is open?
-        blocking_arm_command(command_client, RobotCommandBuilder.arm_stow_command())
+            reset_before_regrasp(command_client, initial_transforms)
 
-        walk_to_pose_in_initial_frame(command_client, initial_transforms, x=0.0, y=0.0, angle=0.0)
+            # Grasp the hose to get it UNSTUCK
+            walk_to_then_grasp(robot, robot_state_client, image_client, command_client, manipulation_api_client,
+                               get_hose_and_regrasp_point,
+                               first_get_point_kwargs={'ideal_dist_to_obs': 5},
+                               second_get_point_kwargs={'ideal_dist_to_obs': 40})
 
-        # Grasp the hose to get it UNSTUCK
-        walk_to_then_grasp(robot, robot_state_client, image_client, command_client, manipulation_api_client,
-                           get_hose_and_regrasp_point, first_get_point_kwargs={'ideal_dist_to_obs': 5},
-                           second_get_point_kwargs={'ideal_dist_to_obs': 30})
+            # Move the arm to get the hose unstuck
+            # TODO: use homotopy planner here
+            blocking_arm_command(command_client, look_at_command(robot_state_client, 1.0, 0, 0.2))
+            blocking_arm_command(command_client, look_at_command(robot_state_client, 1.0, -0.4, 0.2))
+            blocking_arm_command(command_client, look_at_command(robot_state_client, 1.0, -0.4, -0.5))
 
-        # Move the arm to get the hose unstuck
-        blocking_arm_command(command_client, look_at_command(robot_state_client, 1.0, 0, 0.2))
-        blocking_arm_command(command_client, look_at_command(robot_state_client, 1.0, -0.4, 0.2))
-        blocking_arm_command(command_client, look_at_command(robot_state_client, 1.0, -0.4, -0.5))
+            # Open the gripper
+            command_client.robot_command(RobotCommandBuilder.claw_gripper_open_command())
+            time.sleep(1)  # FIXME: how to block on a gripper command?
+            blocking_arm_command(command_client, RobotCommandBuilder.arm_stow_command())
 
-        # Open the gripper
-        command_client.robot_command(RobotCommandBuilder.claw_gripper_open_command())
-        time.sleep(1)  # FIXME: how to block on a gripper command?
+            # reset before trying again
+            walk_to_pose_in_initial_frame(command_client, initial_transforms, x=0, y=0, angle=0)
 
-        # Stow
-        blocking_arm_command(command_client, RobotCommandBuilder.arm_stow_command())
-
-        # Look at the scene
-        walk_to_pose_in_initial_frame(command_client, initial_transforms, x=0, y=0, angle=0)
-
-        # Grasp the hose to DRAG again
-        walk_to_then_grasp(robot, robot_state_client, image_client, command_client, manipulation_api_client,
-                           get_hose_and_head_point)
-
-        # try again to drag the hose to the goal
-        goal_reached = drag_rope_to_goal(robot_state_client, command_client, initial_transforms, mess_x, mess_y,
-                                         np.pi / 2)
-        robot.logger.info("Goal reached: %s", goal_reached)
+        # raise arm a bit
+        raise_hand(command_client, robot_state_client, 0.1)
+        # rotate to give a better view
+        walk_to_pose_in_initial_frame(command_client, initial_transforms, x=mess_x + 0.7, y=mess_y + 0.15,
+                                      angle=np.deg2rad(180), crawl=True)
 
         command_client.robot_command(RobotCommandBuilder.claw_gripper_open_command())
         time.sleep(1)
         blocking_arm_command(command_client, RobotCommandBuilder.arm_stow_command())
 
-        # TODO: rotate around hand?
-        # This is sort of cheating, since we're not monitoring force
-        # walk_to_pose_in_initial_frame(command_client, initial_transforms, x=3, y=-1.9, angle=0, block=True)
+        # Go home, you're done!
         walk_to_pose_in_initial_frame(command_client, initial_transforms, x=0.0, y=0.0, angle=0.0)
+        print("Done!")
 
-        input("Press enter to finish")
-        return
+
+def reset_before_regrasp(command_client, initial_transforms):
+    command_client.robot_command(RobotCommandBuilder.claw_gripper_open_command())
+    time.sleep(1)  # FIXME: block until gripper is open?
+    blocking_arm_command(command_client, RobotCommandBuilder.arm_stow_command())
+    walk_to_pose_in_initial_frame(command_client, initial_transforms, x=0.0, y=0.0, angle=0.0)
+
+
+def raise_hand(command_client, robot_state_client, dz):
+    transforms = robot_state_client.get_robot_state().kinematic_state.transforms_snapshot
+    hand_in_body = get_a_tform_b(transforms, GRAV_ALIGNED_BODY_FRAME_NAME, HAND_FRAME_NAME)
+    raise_cmd = RobotCommandBuilder.arm_pose_command(hand_in_body.x, hand_in_body.y, hand_in_body.z + dz,
+                                                     hand_in_body.rot.w, hand_in_body.rot.x, hand_in_body.rot.y,
+                                                     hand_in_body.rot.z,
+                                                     GRAV_ALIGNED_BODY_FRAME_NAME,
+                                                     0.5)
+    blocking_arm_command(command_client, raise_cmd)
 
 
 def main(argv):
