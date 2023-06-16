@@ -11,10 +11,10 @@ from bosdyn.client import math_helpers
 from bosdyn.client.frame_helpers import get_a_tform_b, BODY_FRAME_NAME
 from bosdyn.client.image import pixel_to_camera_space
 
-from src.cameras_utils import get_color_img, get_depth_img
-from src.detect_regrasp_point import get_polys, DetectionError, hose_points_from_predictions, \
+from conq.cameras_utils import get_color_img, get_depth_img
+from conq.detect_regrasp_point import get_polys, DetectionError, hose_points_from_predictions, \
     detect_object_center, viz_detection, detect_regrasp_point_from_hose
-from src.roboflow_utils import get_predictions
+from conq.roboflow_utils import get_predictions
 
 DEFAULT_IDEAL_DIST_TO_OBS = 70
 

@@ -22,9 +22,9 @@ from bosdyn.client.robot_command import (RobotCommandBuilder, block_for_trajecto
 from bosdyn.client.robot_state import RobotStateClient
 from google.protobuf import wrappers_pb2
 
-from src.detect_regrasp_point import DetectionError, min_angle_to_x_axis
-from src.get_detections import GetRetryResult, get_hose_and_head_point, get_hose_and_regrasp_point, get_mess
-from src.utils import blocking_arm_command, block_for_manipulation_api_command, setup_and_stand, rot_2d
+from conq.detect_regrasp_point import DetectionError, min_angle_to_x_axis
+from conq.get_detections import GetRetryResult, get_hose_and_head_point, get_hose_and_regrasp_point, get_mess
+from conq.utils import blocking_arm_command, block_for_manipulation_api_command, setup_and_stand, rot_2d
 
 HIGH_FORCE_THRESHOLD = 16
 FORCE_BUFFER_SIZE = 15
@@ -327,7 +327,7 @@ def arm_pull_rope(config):
     lease_client.take()
 
     # Video recording
-    from src.video_recording import VideoRecorder
+    from conq.video_recording import VideoRecorder
     device_num = 4
     vr = VideoRecorder(device_num, 'video/')
     vr.start_new_recording(f'demo_{int(time.time())}.mp4')

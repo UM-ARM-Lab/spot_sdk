@@ -9,6 +9,8 @@ import numpy as np
 from PIL import Image
 from sklearn.cluster import KMeans
 
+from conq.roboflow_utils import get_predictions
+
 
 class DetectionError(Exception):
     pass
@@ -64,12 +66,6 @@ def pred_to_poly(pred):
     points = pred["points"]
     points = np.array([(p['x'], p['y']) for p in points], dtype=int)
     return points
-
-
-def get_predictions(model, test_image_filename):
-    predictions = get_or_load_predictions(model, test_image_filename)
-    predictions = predictions["predictions"]
-    return predictions
 
 
 def detect_object_center(predictions, class_name):
@@ -185,13 +181,12 @@ def min_angle_to_x_axis(delta):
 
 
 def main():
-    model = init_roboflow()
-
-    test_image_filename = "/home/armlab/spot_sdk/src/data/1686856761/rgb.png"
-    predictions = get_predictions(model, test_image_filename)
+    test_image_filename = "data/1686856761/rgb.png"
 
     rgb_pil = Image.open(test_image_filename)
     rgb_np = np.asarray(rgb_pil)
+
+    predictions = get_predictions(rgb_np)
 
     detection = detect_regrasp_point(rgb_np, predictions, ideal_dist_to_obs=50)
     print(detection)

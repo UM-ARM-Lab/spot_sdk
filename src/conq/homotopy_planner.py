@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image
 
-from src.detect_regrasp_point import get_polys, DetectionError, detect_regrasp_point
+from conq.detect_regrasp_point import get_polys, DetectionError, detect_regrasp_point
 
 
 def make_tau(start, goal, waypoint):
@@ -60,10 +60,10 @@ def compare_waypoint_homotopy(start, goal, waypoint1, waypoint2, obstacle_center
 
 
 def main():
-    rgb = Image.open("above2.png")
+    rgb = Image.open("data/1686855846/rgb.png")
     rgb_np = np.asarray(rgb)
     h, w = rgb_np.shape[:2]
-    with open("above2.json") as f:
+    with open("data/1686855846/pred.json") as f:
         predictions = json.load(f)
 
     # Convert the image and predictions into the obstacle, start, goal, and midpoint representations
