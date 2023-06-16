@@ -23,7 +23,7 @@ from bosdyn.client.robot_state import RobotStateClient
 from google.protobuf import wrappers_pb2
 
 from src.detect_regrasp_point import DetectionError, min_angle_to_x_axis
-from src.get_funcs import GetRetryResult, get_hose_and_head_point, get_hose_and_regrasp_point, get_mess
+from src.get_detections import GetRetryResult, get_hose_and_head_point, get_hose_and_regrasp_point, get_mess
 from src.utils import blocking_arm_command, block_for_manipulation_api_command, setup_and_stand, rot_2d
 
 HIGH_FORCE_THRESHOLD = 16

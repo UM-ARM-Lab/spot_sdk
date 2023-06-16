@@ -1,5 +1,4 @@
 import itertools
-import os
 from dataclasses import dataclass
 from typing import List, Dict
 
@@ -8,11 +7,7 @@ import matplotlib.cm as cm
 import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image
-from roboflow import Roboflow
 from sklearn.cluster import KMeans
-
-MIN_CONFIDENCE = 0.10
-MODEL_VERSION = 18
 
 
 class DetectionError(Exception):
@@ -24,29 +19,6 @@ class DetectionResult:
     grasp_px: np.ndarray
     candidates_pxs: np.ndarray
     predictions: List[Dict[str, np.ndarray]]
-
-
-def init_roboflow():
-    rf = Roboflow(api_key=os.environ['ROBOFLOW_API_KEY'])
-    project = rf.workspace().project("spot-vaccuming-demo")
-    model = project.version(MODEL_VERSION).model
-    return model
-
-
-def get_or_load_predictions(model, test_image_filename):
-    predictions = model.predict(test_image_filename, confidence=MIN_CONFIDENCE).json()
-    return predictions
-    # image_path = Path(test_image_filename)
-    # predictions_path = Path(f"{image_path.stem}_pred.json")
-    # if predictions_path.exists():
-    #     with predictions_path.open("r") as f:
-    #         predictions = json.load(f)
-    # else:
-    #
-    #     with predictions_path.open("w") as f:
-    #         json.dump(predictions, f)
-    #
-    # return predictions
 
 
 def viz_detection(rgb_np, detection):
@@ -77,8 +49,6 @@ def viz_detection(rgb_np, detection):
 def get_polys(predictions, desired_class_name):
     polys = []
     for pred in predictions:
-        if pred['confidence'] < MIN_CONFIDENCE:
-            continue
         class_name = pred["class"]
         points = pred_to_poly(pred)
 
