@@ -75,7 +75,8 @@ class RecordingInterface(object):
             '7': self._create_new_edge,
             '8': self._create_loop,
             '9': self._auto_close_loops_prompt,
-            'a': self._optimize_anchoring
+            'a': self._optimize_anchoring,
+            's': self._create_shed_waypoint
         }
 
     def should_we_start_recording(self):
@@ -150,6 +151,14 @@ class RecordingInterface(object):
             print("Successfully created a waypoint.")
         else:
             print("Could not create a waypoint.")
+    
+    def _create_shed_waypoint(self, *args):
+        """Create waypoint that represents a shed in the map."""
+        resp = self._recording_client.create_waypoint(waypoint_name="shed")
+        if resp.status == recording_pb2.CreateWaypointResponse.STATUS_OK:
+            print("Successfully created a shed waypoint.")
+        else:
+            print("Could not add the shed waypoint")
 
     def _download_full_graph(self, *args):
         """Download the graph and snapshots from the robot."""
@@ -383,6 +392,7 @@ class RecordingInterface(object):
             (9) Automatically find and close loops.
             (a) Optimize the map's anchoring.
             (q) Exit.
+            (s) Add shed waypoint.
             """)
             try:
                 inputs = input('>')
